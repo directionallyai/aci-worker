@@ -85,33 +85,34 @@
 //!   7. derive the session key via session_protocol::derive_session_key()
 //!   8. read one AES-256-GCM frame (AAD "client-to-server"), decrypt ->
 //!      {mode, code, storage_grant, pattern_delegate}
-//!   9. run_worker(): run the worker body natively (python:3.12-alpine's
-//!      own interpreter, no emulation) inside a bubblewrap sandbox
+//!   9. run_worker(): fetch_worker_bundle() resolves and verifies a
+//!      content-hash-pinned tarball from CAS -- a self-contained Python
+//!      runtime (interpreter, its own dependencies, worker.py/storage.py
+//!      themselves, all published from worker-python-runtime, a
+//!      separate, public repo) -- extracts it, and execs its own
+//!      `runtime` entry point natively inside a bubblewrap sandbox
 //!      (unprivileged user/mount/pid namespace confinement -- see that
-//!      function's own doc comment), feeding it {mode, code, storage_grant,
-//!      pattern_delegate} on stdin the same shape worker.py's own
-//!      handle() already expects. Ordinarily this image's own baked-in
-//!      /opt/worker/worker.py; when the request names a `worker_bundle`
-//!      instead, fetch_worker_bundle() resolves and verifies a
-//!      content-hash-pinned zip from CAS first, and worker/storage
-//!      resolve out of that archive via PYTHONPATH (zipimport, never
-//!      extracted) instead
+//!      function's own doc comment), feeding it {mode, code,
+//!      storage_grant, pattern_delegate} on stdin the same shape
+//!      worker.py's own handle() already expects
 //!   10. encrypt the result (AAD "server-to-client"), write it, exit
 //!
-//! worker.py/storage.py are baked into this image directly
-//! (/opt/worker/, COPY'd in at build time) as the *default* -- see
-//! run_worker()'s own doc comment for why that default exists: an
-//! earlier revision of this file fetched them from CAS by content-hash
-//! on every request, then a RISC-V-emulation-based sandbox (rvlinux)
-//! needed them baked into its own read-only guest filesystem at build
-//! time instead, and sandlock's native-execution model kept that same
-//! baked-in shape (just without the emulation). A per-session,
-//! content-hash-verified fetch is back as an *opt-in* override
-//! (`worker_bundle` in the request, see fetch_worker_bundle()) now that
-//! neither of those execution-model constraints still applies -- the
-//! image's own CCE-pinned surface no longer has to include worker.py/
-//! storage.py at all for a caller that supplies its own pinned bundle
-//! hash instead.
+//! This image itself carries no Python at all, and no baked-in default
+//! worker.py/storage.py -- every session fetches and verifies its own
+//! runtime tarball by content hash (`worker_bundle` in the request, see
+//! fetch_worker_bundle()); a request without one is refused outright.
+//! Earlier revisions of this file baked worker.py/storage.py into the
+//! image directly (first for a RISC-V-emulation-based sandbox, rvlinux,
+//! that needed them in its own read-only guest filesystem at build time;
+//! sandlock's native-execution model kept that same baked-in shape after
+//! rvlinux was dropped; then a python:3.12-alpine base image with a
+//! per-session fetch as an *opt-in* override on top). None of those
+//! execution-model constraints still apply, and worker-python-runtime's
+//! own README explains why worker.py/storage.py being committed there in
+//! the open (rather than kept private) is a deliberate choice, not a
+//! leak -- the trust boundary here is "which exact worker_bundle hash is
+//! running," verified via MAA/CCE attestation plus the hash itself, not
+//! "keep the workload source private."
 //!
 //! Master/worker split, not a single in-process call: worker.py's own
 //! worker.handle() runs submitted -e/repl code by calling eval()/exec()
@@ -153,7 +154,7 @@ use aci_worker::session_protocol::{binding_hash, derive_session_key, SHARED_QUEU
 use p256::{PublicKey, SecretKey};
 // Not feature-gated, unlike the aci-attestation-only imports above: these
 // three back fetch_worker_bundle(), which run_worker() calls unconditionally
-// (run_worker() itself, WORKER_PY_PATH, BWRAP_BIN etc. are all ungated too).
+// (run_worker() itself, BWRAP_BIN etc. are all ungated too).
 use s3::bucket::Bucket;
 use s3::creds::Credentials;
 use s3::region::Region;
@@ -760,10 +761,10 @@ pub async fn get_maa_token(
 
 // -- worker execution, via bubblewrap ----------------------------------------
 //
-// worker.py/storage.py are baked into this image's own filesystem at
-// Docker build time (COPY'd into /opt/worker/ in the runtime stage), not
-// fetched per session from CAS the way an earlier revision of this file
-// did. `storage_grant` is still read from the request -- that's what
+// This image carries no Python and no baked-in worker.py/storage.py at
+// all -- every session fetches its own self-contained runtime tarball
+// (worker-python-runtime, a separate, public repo) fresh, by content
+// hash. `storage_grant` is still read from the request -- that's what
 // storage.py itself uses at runtime to reach World's own KV/S3 storage,
 // a separate concern from how worker.py's own source arrived.
 //
@@ -780,39 +781,48 @@ pub async fn get_maa_token(
 // maintained project, not something hand-rolled the way sandlock's own
 // fork was.
 const BWRAP_BIN: &str = "bwrap";
-const WORKER_PY_PATH: &str = "/opt/worker/worker.py";
 
-/// Fetches and verifies a worker bundle body -- a zip containing worker.py
-/// and storage.py -- from the shared/global CAS prefix (`v4/assets/<hash>`
-/// by default, matching storage.py's own `Bucket.asset_prefix`), reusing
-/// the SAME storage_grant credential the request already carries for
-/// worker.py's own S3 access: no new credential-minting capability, no new
-/// trust boundary crossed. The bundle is content-addressed and never
+/// Fetches, verifies, and extracts a worker runtime bundle -- a tar.gz
+/// containing a self-contained Python interpreter, its own dependencies,
+/// and worker.py/storage.py themselves (worker-python-runtime, a
+/// separate, public repo; see that repo's own README) -- from the
+/// shared/global CAS prefix (`v4/assets/<hash>` by default, matching
+/// storage.py's own `Bucket.asset_prefix`), reusing the SAME
+/// storage_grant credential the request already carries for worker.py's
+/// own S3 access: no new credential-minting capability, no new trust
+/// boundary crossed. The bundle is content-addressed and never
 /// encrypted, same posture as world.py's own bootstrap body and the
 /// reviewer bundle -- this is infrastructure, not account-private data.
 ///
-/// Writes the raw zip bytes to a fixed local path rather than extracting
-/// anything: run_worker() binds just that one file into the sandbox and
-/// sets PYTHONPATH to it, and Python's own zipimport resolves `worker`/
-/// `storage` straight out of the archive's central directory on demand --
-/// nothing is ever unpacked to disk, so there is no path-traversal surface
-/// the way tar extraction has (see world.py's own _run_reviewer_agent(),
-/// which needs an explicit member-path check for exactly that reason).
+/// Extracted to a fixed, hash-named directory under /tmp
+/// (worker-runtime-<hash>/) rather than a single file: unlike the
+/// earlier zip-of-two-files shape (zipimport, PYTHONPATH-mounted,
+/// nothing ever unpacked), this bundle carries a real interpreter binary
+/// that has to exist on disk as an actual file bwrap can bind and exec,
+/// not something Python's own import machinery can resolve out of an
+/// archive in-memory. Idempotent by construction: if
+/// <dir>/runtime/runtime already exists, this is a cache hit and nothing
+/// is fetched or re-extracted -- the common case for a shared-worker-pool
+/// container serving more than one job across its own lifetime (see
+/// is_shared_worker()'s own doc comment), which would otherwise pay this
+/// fetch/extract cost on every job instead of once.
 ///
 /// Fails closed: a malformed grant, an unreachable store, a non-200
-/// response, or a body whose own SHA-256 doesn't match the requested hash
-/// all return `Err` -- run_worker() refuses the whole request rather than
-/// silently falling back to the image's own baked-in copy, since a caller
-/// that named a specific hash and didn't get it back should never run a
-/// different body than the one it asked for.
+/// response, a body whose own SHA-256 doesn't match the requested hash,
+/// or a tar.gz that fails to extract all return `Err` -- run_worker()
+/// refuses the whole request rather than running anything it couldn't
+/// fully verify, since a caller that named a specific hash and didn't
+/// get it back should never run a different body than the one it asked
+/// for. There is no baked-in fallback to silently run instead.
 ///
 /// Who supplies `sha256_hex` matters more than anything in this function:
 /// it must be a reviewed, pinned constant the attested client itself
-/// carries (agent.py's own committed value), never derived, fetched, or
-/// accepted from an unreviewed source at runtime -- the same posture
-/// trusted_hashes.py's own module doc already argues for. This function
-/// only ever verifies that the bytes match the hash it was given; it has
-/// no opinion on whether that hash was the right one to ask for.
+/// carries (agent.py's own committed value, trusted_hashes.py's
+/// ACI_WORKER_BUNDLE_SHA256), never derived, fetched, or accepted from an
+/// unreviewed source at runtime -- the same posture trusted_hashes.py's
+/// own module doc already argues for. This function only ever verifies
+/// that the bytes match the hash it was given; it has no opinion on
+/// whether that hash was the right one to ask for.
 ///
 /// Not feature-gated, matching run_worker() itself (its caller) -- see the
 /// s3::/sha2:: import comments above.
@@ -824,6 +834,12 @@ async fn fetch_worker_bundle(
         return Err(format!("invalid worker_bundle sha256: {sha256_hex:?}"));
     }
     let sha256_hex = sha256_hex.to_ascii_lowercase();
+
+    let extract_dir = std::path::PathBuf::from(format!("/tmp/worker-runtime-{sha256_hex}"));
+    let runtime_entry_point = extract_dir.join("runtime").join("runtime");
+    if tokio::fs::metadata(&runtime_entry_point).await.is_ok() {
+        return Ok(extract_dir.join("runtime"));
+    }
 
     let get_str = |field: &str| -> Result<String, String> {
         storage_grant
@@ -873,11 +889,39 @@ async fn fetch_worker_bundle(
         ));
     }
 
-    let path = std::path::PathBuf::from(format!("/tmp/worker-bundle-{sha256_hex}.zip"));
-    tokio::fs::write(&path, &body)
+    // Extract into a fresh temp dir first, then rename into place --
+    // extraction failing partway through must never leave a directory at
+    // extract_dir that looks cache-hit-eligible (runtime/runtime present)
+    // but is actually incomplete/corrupt.
+    let tmp_dir = std::path::PathBuf::from(format!("/tmp/worker-runtime-{sha256_hex}.tmp"));
+    let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+    tokio::fs::create_dir_all(&tmp_dir)
         .await
-        .map_err(|e| format!("worker_bundle write {path:?}: {e}"))?;
-    Ok(path)
+        .map_err(|e| format!("worker_bundle mkdir {tmp_dir:?}: {e}"))?;
+    {
+        let tmp_dir = tmp_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(body));
+            tar::Archive::new(decoder).unpack(&tmp_dir)
+        })
+        .await
+        .map_err(|e| format!("worker_bundle extract {key}: join error: {e}"))?
+        .map_err(|e| format!("worker_bundle extract {key}: {e}"))?;
+    }
+    if tokio::fs::metadata(tmp_dir.join("runtime").join("runtime"))
+        .await
+        .is_err()
+    {
+        return Err(format!(
+            "worker_bundle {key} extracted but runtime/runtime is missing -- not a valid worker-python-runtime tarball"
+        ));
+    }
+    let _ = tokio::fs::remove_dir_all(&extract_dir).await;
+    tokio::fs::rename(&tmp_dir, &extract_dir)
+        .await
+        .map_err(|e| format!("worker_bundle rename {tmp_dir:?} -> {extract_dir:?}: {e}"))?;
+
+    Ok(extract_dir.join("runtime"))
 }
 
 #[derive(serde::Serialize)]
@@ -902,9 +946,10 @@ struct WorkerFailure<'a> {
 ///
 /// `--ro-bind /bin /bin --ro-bind /lib /lib`: this only has to prove
 /// bubblewrap can confine *something*, not run a real worker -- `true`
-/// needs both paths for the same reason WORKER_PY_PATH's own python3
-/// invocation needs `/usr`+`/lib` below (a dynamically-linked musl
-/// binary needs its loader readable, not just its own binary).
+/// needs both paths for the same reason the fetched runtime's own
+/// interpreter invocation needs `/usr`+`/lib` below (a
+/// dynamically-linked musl binary needs its loader readable, not just
+/// its own binary).
 ///
 /// No `--proc /proc`: confirmed live on a real Confidential ACI container
 /// that this specific flag is what fails there ("Can't mount proc on
@@ -978,8 +1023,8 @@ async fn bwrap_available() -> bool {
     *BWRAP_AVAILABLE.get_or_init(bwrap_self_test).await
 }
 
-/// Runs the baked-in `/opt/worker/worker.py` natively (this image's own
-/// python3, no emulation) inside a bubblewrap sandbox -- unprivileged
+/// Runs the fetched worker_bundle runtime natively (its own bundled
+/// interpreter, no emulation) inside a bubblewrap sandbox -- unprivileged
 /// user/mount/pid namespaces, enforced by the kernel directly against the
 /// real process, not a RISC-V guest the way the earlier rvlinux-based
 /// sandbox worked. Feeds `request` on stdin and reads the response from
@@ -988,14 +1033,15 @@ async fn bwrap_available() -> bool {
 /// function) already used -- only the execution engine changed, not the
 /// protocol.
 ///
-/// Readable paths are the minimum this repo has confirmed CPython/TLS
-/// actually need: `/usr` (the interpreter itself, including its
-/// `/usr/local` install location and `libpython*.so`) and `/lib` (the
-/// musl dynamic loader) for the interpreter to start at all, `/bin` for
-/// scripts unpacked into `/tmp` whose shebangs and subprocesses use the
-/// system shell, `/etc/ssl`
-/// and `/etc/resolv.conf`/`/etc/hosts` for storage.py's own real HTTPS
-/// S3 calls, and `/opt/worker` for worker.py/storage.py themselves.
+/// Readable paths are the minimum this repo has confirmed the bundled
+/// interpreter/TLS stack actually need: `/usr` and `/lib` (the musl
+/// dynamic loader and system shared libraries the bundled interpreter's
+/// own binary links against) for it to start at all, `/bin` for scripts
+/// unpacked into `/tmp` whose shebangs and subprocesses use the system
+/// shell, `/etc/ssl` and `/etc/resolv.conf`/`/etc/hosts` for storage.py's
+/// own real HTTPS S3 calls, and the extracted worker_bundle directory
+/// itself (fetch_worker_bundle()'s own doc comment) for the interpreter,
+/// its dependencies, and worker.py/storage.py all together.
 /// `--share-net` (kept, not unshared, as part of `--unshare-all`): full
 /// outbound socket access, the same unrestricted network posture the
 /// sandlock-based version's `--net-allow '*'` gave -- fine-grained
@@ -1082,29 +1128,28 @@ async fn run_worker(request: &serde_json::Value, timeout: Duration) -> serde_jso
         Err(e) => return worker_failure(&format!("could not serialize request: {e}")),
     };
 
-    // Optional: a caller-named, content-hash-verified worker bundle instead
-    // of this image's own baked-in /opt/worker/worker.py -- see
-    // fetch_worker_bundle()'s own doc comment. Resolved once, up front, so
-    // a fetch/verify failure refuses the whole request before any sandbox
-    // even spawns -- the same "unverifiable code does not get executed"
-    // posture install.sh's own setup-script check already uses. `None`
-    // (the request carries no `worker_bundle` field at all) falls straight
-    // through to today's unchanged baked-in behavior below.
-    let worker_bundle_path = match request
+    // Mandatory: this image carries no Python and no baked-in
+    // worker.py/storage.py at all, so a request with no `worker_bundle`
+    // field has nothing this binary could possibly run -- refused
+    // outright, the same "unverifiable/absent code does not get
+    // executed" posture install.sh's own setup-script check already
+    // uses. See fetch_worker_bundle()'s own doc comment for the
+    // fetch/verify/extract this resolves.
+    let Some(sha256_hex) = request
         .get("worker_bundle")
         .and_then(|v| v.get("sha256"))
         .and_then(|v| v.as_str())
-    {
-        Some(sha256_hex) => {
-            let Some(storage_grant) = request.get("storage_grant") else {
-                return worker_failure("worker_bundle given but request carries no storage_grant");
-            };
-            match fetch_worker_bundle(storage_grant, sha256_hex).await {
-                Ok(path) => Some(path),
-                Err(e) => return worker_failure(&format!("could not resolve worker_bundle: {e}")),
-            }
-        }
-        None => None,
+    else {
+        return worker_failure(
+            "request carries no worker_bundle -- this image has no baked-in default to fall back to",
+        );
+    };
+    let Some(storage_grant) = request.get("storage_grant") else {
+        return worker_failure("worker_bundle given but request carries no storage_grant");
+    };
+    let worker_bundle_path = match fetch_worker_bundle(storage_grant, sha256_hex).await {
+        Ok(path) => path,
+        Err(e) => return worker_failure(&format!("could not resolve worker_bundle: {e}")),
     };
 
     // kill_on_drop: without this, dropping `child` (which is exactly what
@@ -1121,12 +1166,17 @@ async fn run_worker(request: &serde_json::Value, timeout: Duration) -> serde_jso
     // function's own doc comment for why a sandboxless fallback exists
     // at all on hosts confirmed to lack a working user-namespace sandbox.
     //
-    // worker_bundle_path, when resolved, changes what gets bound and run
-    // in both shapes: bind just that one zip (never extracted -- Python's
-    // own zipimport resolves worker/storage out of it via PYTHONPATH) in
-    // place of the whole /opt/worker directory, and launch via `python3 -c
-    // "import worker; worker.main()"` in place of a fixed script path,
-    // since there is no longer a fixed path to run.
+    // worker_bundle_path is the extracted runtime directory
+    // (fetch_worker_bundle()'s own doc comment) -- bound whole, and
+    // exec'd via its own `runtime` entry-point script rather than a
+    // `python3 -c` invocation: there is no base-image python3 to invoke
+    // at all anymore, and the entry point itself already knows how to
+    // launch worker.py correctly (see worker-python-runtime's own
+    // README). No PYTHONPATH needed either -- worker.py/storage.py live
+    // in this same tree's own site-packages, already on the bundled
+    // interpreter's default sys.path.
+    let bundle = worker_bundle_path.to_string_lossy().into_owned();
+    let entry_point = worker_bundle_path.join("runtime").to_string_lossy().into_owned();
     let mut command = if bwrap_available().await {
         let mut c = Command::new("timeout");
         c.arg("-s").arg("9")
@@ -1147,41 +1197,18 @@ async fn run_worker(request: &serde_json::Value, timeout: Duration) -> serde_jso
             .arg("--chmod").arg("1777").arg("/tmp")
             .arg("--setenv").arg("PYTHONDONTWRITEBYTECODE").arg("1")
             .arg("--uid").arg(worker_uid().to_string())
-            .arg("--gid").arg(worker_gid().to_string());
-        match &worker_bundle_path {
-            // The --ro-bind for the bundle file must come after --tmpfs
+            .arg("--gid").arg(worker_gid().to_string())
+            // The --ro-bind for the bundle dir must come after --tmpfs
             // /tmp above, not before -- bwrap applies mount actions in
             // argument order, and a bind targeting a path under /tmp
-            // issued before the fresh tmpfs is mounted there would just be
-            // shadowed by it.
-            Some(bundle_path) => {
-                let bundle = bundle_path.to_string_lossy().into_owned();
-                c.arg("--ro-bind").arg(&bundle).arg(&bundle)
-                    .arg("--setenv").arg("PYTHONPATH").arg(&bundle)
-                    .arg("--")
-                    .arg("python3").arg("-c").arg("import worker; worker.main()");
-            }
-            None => {
-                c.arg("--ro-bind").arg("/opt/worker").arg("/opt/worker")
-                    .arg("--")
-                    .arg("python3").arg(WORKER_PY_PATH);
-            }
-        }
+            // issued before the fresh tmpfs is mounted there would just
+            // be shadowed by it.
+            .arg("--ro-bind").arg(&bundle).arg(&bundle)
+            .arg("--")
+            .arg(&entry_point);
         c
     } else {
-        let mut c = match &worker_bundle_path {
-            Some(bundle_path) => {
-                let mut c = Command::new("python3");
-                c.arg("-c").arg("import worker; worker.main()")
-                    .env("PYTHONPATH", bundle_path);
-                c
-            }
-            None => {
-                let mut c = Command::new("python3");
-                c.arg(WORKER_PY_PATH);
-                c
-            }
-        };
+        let mut c = Command::new(&entry_point);
         c.env("PYTHONDONTWRITEBYTECODE", "1")
             .uid(worker_uid())
             .gid(worker_gid());
@@ -1930,5 +1957,33 @@ mod worker_bundle_tests {
         });
         let err = fetch_worker_bundle(&grant, &valid_hash).await.unwrap_err();
         assert!(err.contains("storage_grant missing bucket"), "{err}");
+    }
+
+    /// A pre-existing extracted runtime/runtime file must short-circuit
+    /// straight to Ok() -- proven here by using a storage_grant that
+    /// would fail the very next check (missing "bucket") if the cache
+    /// check were skipped or ordered after grant validation.
+    #[tokio::test]
+    async fn cache_hit_skips_the_grant_check_and_any_network_call() {
+        let hash = "b".repeat(64);
+        let extract_dir = std::path::PathBuf::from(format!("/tmp/worker-runtime-{hash}"));
+        let entry_point = extract_dir.join("runtime").join("runtime");
+        tokio::fs::create_dir_all(entry_point.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&entry_point, b"#!/bin/sh\n")
+            .await
+            .unwrap();
+
+        let grant_missing_bucket = serde_json::json!({
+            "access_key_id": "a", "secret_access_key": "b",
+            "endpoint": "https://example.invalid",
+        });
+        let resolved = fetch_worker_bundle(&grant_missing_bucket, &hash)
+            .await
+            .expect("cache hit must not touch storage_grant validation at all");
+        assert_eq!(resolved, extract_dir.join("runtime"));
+
+        tokio::fs::remove_dir_all(&extract_dir).await.unwrap();
     }
 }

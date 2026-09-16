@@ -53,6 +53,15 @@ sev = { version = "8", default-features = false, features = ["snp"], optional = 
 # rustls-tls usage need.
 rust-s3 = { version = "=0.37.2", default-features = false, features = ["with-tokio", "tokio-rustls-tls"] }
 
+# fetch_worker_bundle()'s own extraction of the worker-python-runtime
+# tarball it fetches -- a self-contained Python runtime (interpreter,
+# deps, worker.py/storage.py), not the two-file zip an earlier revision
+# of this function zipimported instead. tar itself only understands the
+# tar format; flate2 is the gzip layer around it (GzDecoder wraps the
+# reader tar::Archive consumes).
+tar = "0.4"
+flate2 = "1"
+
 # session_master's own client leg dials back out over h2c (h2 -- no TLS:
 # this connection is meant to stay inside a trusted network path back to
 # attested-python-execution's own attested_session.rs, not exposed the
