@@ -1,0 +1,102 @@
+name: Build and Push ACI Session Worker Image
+
+# Publishes the Azure Confidential ACI variant of the worker image --
+# aci/arm-template.json's own `image` parameter points at whatever this
+# publishes, by digest (aci/resolve-image-digest.sh resolves it).
+# Genuinely single-repo build context now (this repo's own root; nothing
+# reaches outside it) -- split out of attested-python-execution (a
+# separate, private repo) specifically so this is true: that repo's own
+# Cargo dependency on this one's session_protocol crate is a one-way,
+# ordinary external dependency, never the reverse. Published public:
+# nothing in it is secret, and Azure needs to pull it into the container
+# group it launches without a registry credential. GHCR container package
+# visibility can't be flipped by this workflow's own GITHUB_TOKEN (needs a
+# PAT with repo + write:packages scope, or the GitHub UI) -- set to public
+# once, manually, after this workflow's first successful push (package
+# Settings -> Change visibility).
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'aci/**'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/aci-session-worker-build.yml'
+  workflow_dispatch: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/aci-session-worker
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Loaded locally (not pushed yet) so the next step can actually run
+      # it -- catches exactly the regression this workflow once shipped
+      # silently (attested-python-execution's own git history, before
+      # this repo existed): aci/Dockerfile's own two-pass build (a
+      # dummy-binary pass to cache dependencies, then the real one
+      # compiling src/) can drift out of sync on which --features get
+      # passed to each pass. Since session_master.rs's build variant is a
+      # compile-time #[cfg(feature = "aci-attestation")] choice (not a
+      # runtime check), nothing at deploy time could catch a mismatch --
+      # only actually running the built binary can.
+      - name: Build image (local, for verification)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: aci/Dockerfile
+          push: false
+          load: true
+          tags: aci-session-worker:verify
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Runs the real compiled binary and checks for the log line only
+      # main()'s aci-attestation branch prints (see session_master.rs).
+      # ACI_CALLBACK_ADDR/_TOKEN are deliberately left unset -- this
+      # container is expected to log that line and then fail fast on
+      # them being missing; only the log line itself is being checked,
+      # not a full session. `|| true` on the run so that expected
+      # failure doesn't fail this step before the grep gets to run.
+      - name: Verify the image built the aci-attestation variant
+        run: |
+          set -e
+          output=$(timeout 30s docker run --rm aci-session-worker:verify 2>&1 || true)
+          echo "$output"
+          if ! echo "$output" | grep -q "session-master (aci-attestation build) starting"; then
+            echo "::error::Built image never logged the aci-attestation startup line -- it was very likely compiled without --features aci-attestation (check aci/Dockerfile's two cargo build passes agree). Refusing to push a Lambda-variant binary under the ACI image tag."
+            exit 1
+          fi
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: aci/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

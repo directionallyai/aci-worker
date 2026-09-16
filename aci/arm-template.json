@@ -1,0 +1,167 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+  "_comment": [
+    "Confidential ACI container group for aci_session_master (this",
+    "directory's own Dockerfile) -- one h2 attested-session per launch,",
+    "then the process exits and Azure tears the group down. Shape copied",
+    "from Microsoft's own real tutorial template",
+    "(container-instances-tutorial-deploy-confidential-containers-cce-arm,",
+    "raw.githubusercontent.com/microsoft/confidential-container-demos/",
+    "main/hello-world/ACI/arm-template.json) -- the `sku`/",
+    "`confidentialComputeProperties` pair is what turns an ordinary",
+    "container group into a confidential one; without them the group",
+    "deploys but nothing in it validates.",
+    "",
+    "`image` defaults to a placeholder -- resolve-image-digest.sh fills in",
+    "the real `ghcr.io/directionallyai/aci-worker/aci-session-worker@sha256:...`",
+    "reference by digest (never a mutable tag: the CCE policy's own `id`",
+    "field pins the same digest, so a tag that moved out from under it",
+    "would just make az confcom's policy generation and this template",
+    "disagree about which image runs, not any kind of real substitution",
+    "attack -- the SNP report's `layers` check is what actually gets",
+    "verified at container start).",
+    "",
+    "`ccePolicy` starts empty -- `az confcom acipolicygen -a arm-template.json`",
+    "fills it in (and prints its own SHA-256, the value",
+    "update-policy-hashes.sh/agent.py's AZURE_ACI_EXPECTED_POLICY_HASH",
+    "needs) once `image` above is a real, resolved digest.",
+    "",
+    "restartPolicy is hardcoded to Never, not a parameter -- see",
+    "aci_session_master.rs's own module doc comment for why `Always`/",
+    "`OnFailure` would silently turn 'run one session and exit' into an",
+    "unbounded restart loop reusing the same container. Not something a",
+    "caller of this template should be able to override.",
+    "",
+    "Public IP, not a private VNET endpoint -- deliberate for now, not an",
+    "oversight: the h2 attested-session protocol already assumes a",
+    "hostile network between client and container (that's the whole point",
+    "of the handshake), so the trust boundary here is attestation, not",
+    "network reachability. Worth revisiting if there's ever a reason to",
+    "hide the container's existence entirely, not because a public IP",
+    "weakens what's actually being verified."
+  ]
+  },
+  "parameters": {
+    "name": {
+      "type": "string",
+      "defaultValue": "aci-session-worker",
+      "metadata": {
+        "description": "Name for the container group"
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "North Europe",
+      "metadata": {
+        "description": "Location for all resources -- must be a region where the ACI Confidential SKU is available."
+      }
+    },
+    "image": {
+      "type": "string",
+      "defaultValue": "ghcr.io/directionallyai/aci-worker/aci-session-worker@sha256:0000000000000000000000000000000000000000000000000000000000000",
+      "metadata": {
+        "description": "Container image to deploy, pinned by digest -- resolve-image-digest.sh's own output. Never a mutable tag: the CCE policy generated against this template bakes this exact digest into its own `id`/`layers` fields."
+      }
+    },
+    "port": {
+      "type": "int",
+      "defaultValue": 8081,
+      "metadata": {
+        "description": "Matches AZURE_ACI_PORT's own default in aci_session_master.rs -- the single TCP port the h2 attested-session client connects to."
+      }
+    },
+    "cpuCores": {
+      "type": "int",
+      "defaultValue": 1,
+      "metadata": {
+        "description": "One session, one -e/repl call -- not a long-lived service under sustained load."
+      }
+    },
+    "memoryInGb": {
+      "type": "int",
+      "defaultValue": 1,
+      "metadata": {
+        "description": "The number of CPU cores to allocate to the container."
+      }
+    },
+    "maaEndpoint": {
+      "type": "string",
+      "metadata": {
+        "description": "AZURE_ACI_MAA_ENDPOINT -- e.g. sharedeus2.eus2.attest.azure.net. No default: get_maa_token() refuses to run against an unpinned MAA instance the same way agent.py's own AZURE_ACI_MAA_EXPECTED_ISSUER does on the verifying side."
+      }
+    },
+    "acceptTimeoutSecs": {
+      "type": "int",
+      "defaultValue": 120,
+      "metadata": {
+        "description": "AZURE_ACI_ACCEPT_TIMEOUT_SECS -- how long the container waits for its one client connection before exiting."
+      }
+    },
+    "workerTimeoutSecs": {
+      "type": "int",
+      "defaultValue": 300,
+      "metadata": {
+        "description": "AZURE_ACI_WORKER_TIMEOUT_SECS -- how long worker.py gets to finish running the submitted -e/repl code."
+      }
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.ContainerInstance/containerGroups",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('name')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "confidentialComputeProperties": {
+          "ccePolicy": ""
+        },
+        "containers": [
+          {
+            "name": "[parameters('name')]",
+            "properties": {
+              "image": "[parameters('image')]",
+              "ports": [
+                {
+                  "port": "[parameters('port')]",
+                  "protocol": "TCP"
+                }
+              ],
+              "environmentVariables": [
+                { "name": "AZURE_ACI_PORT", "value": "[string(parameters('port'))]" },
+                { "name": "AZURE_ACI_MAA_ENDPOINT", "value": "[parameters('maaEndpoint')]" },
+                { "name": "AZURE_ACI_ACCEPT_TIMEOUT_SECS", "value": "[string(parameters('acceptTimeoutSecs'))]" },
+                { "name": "AZURE_ACI_WORKER_TIMEOUT_SECS", "value": "[string(parameters('workerTimeoutSecs'))]" }
+              ],
+              "resources": {
+                "requests": {
+                  "cpu": "[parameters('cpuCores')]",
+                  "memoryInGB": "[parameters('memoryInGb')]"
+                }
+              }
+            }
+          }
+        ],
+        "sku": "Confidential",
+        "osType": "Linux",
+        "restartPolicy": "Never",
+        "ipAddress": {
+          "type": "Public",
+          "ports": [
+            {
+              "port": "[parameters('port')]",
+              "protocol": "TCP"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "containerIPv4Address": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.ContainerInstance/containerGroups', parameters('name'))).ipAddress.ip]"
+    }
+  }
+}

@@ -1,0 +1,12 @@
+target/
+# Cargo.lock is committed, not ignored: this is a binary/service crate,
+# and a fresh clone without it would let cargo re-resolve dependencies to
+# their own latest releases again, silently breaking the Dockerfile's
+# `--locked` build.
+**/*.rs.bk
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/
+.idea/

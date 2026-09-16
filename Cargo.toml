@@ -1,0 +1,75 @@
+[package]
+name = "aci-worker"
+version = "0.1.0"
+edition = "2021"
+# Matches the toolchain aci/Dockerfile actually pins (rust:1.93-alpine3.22).
+# With this set, cargo's MSRV-aware resolver prefers dependency versions
+# that still build under 1.93.1 instead of always picking each crate's
+# latest semver-compatible release.
+rust-version = "1.93.1"
+
+[features]
+default = []
+# session_master's own build flag (see that binary's own module doc
+# comment): aci/Dockerfile builds `--features aci-attestation`, which is
+# what session_master's ACI mode -- the only mode this binary has --
+# actually requires; built without it, session_master logs an error and
+# exits immediately rather than linking SEV-SNP report-fetching code
+# (src/bin/session_master.rs's own aci_attestation module) and its `sev`
+# dependency below for nothing.
+aci-attestation = ["dep:sev"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+base64 = "0.21"
+hex = "0.4"
+thiserror = "1"
+log = "0.4"
+env_logger = "0.10"
+
+# session_master's own SNP report fetch (Confidential ACI path) -- reads
+# the raw AMD SEV-SNP attestation report straight off /dev/sev-guest via
+# this crate's ioctl wrapper (Firmware::open()/get_report()), the same
+# device and message format microsoft/confidential-sidecar-containers' own
+# SKR sidecar uses (pkg/attest, confirmed against its real Go source) --
+# not azure-guest-attestation-sdk's vTPM/NV-index path, which is a
+# different mechanism built for full Confidential VMs. default-features
+# disabled: this only ever calls the fetch APIs, never the crate's own
+# report-verification path (that's MAA/agent.py's job, backend repo), so
+# the openssl/crypto_nossl verification backends this crate otherwise
+# pulls in by default are dead weight here.
+sev = { version = "8", default-features = false, features = ["snp"], optional = true }
+
+# session_master's own CAS fetch for the worker bundle it executes
+# (fetch_worker_bundle() -- `worker_bundle.sha256` in the client's
+# request) -- a Rust client for the exact same plain-S3-signed-with-SigV4
+# store storage.py's own Bucket class already talks to from the Python
+# side (backend repo), so this doesn't hand-roll a second SigV4
+# implementation. default-features disabled to drop the sync/attohttpc
+# and native-tls paths neither this binary nor its existing reqwest/
+# rustls-tls usage need.
+rust-s3 = { version = "=0.37.2", default-features = false, features = ["with-tokio", "tokio-rustls-tls"] }
+
+# session_master's own client leg dials back out over h2c (h2 -- no TLS:
+# this connection is meant to stay inside a trusted network path back to
+# attested-python-execution's own attested_session.rs, not exposed the
+# way the client-facing session is) to run the session_protocol frame
+# loop against a launched ACI container. See session_master.rs's own
+# module doc comment.
+h2 = "0.4.19"
+http = "1"
+bytes = "1"
+
+p256 = { version = "0.13", features = ["ecdh"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+uuid = { version = "1.0", features = ["v4"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+ring = "0.17.14"
+
+[dev-dependencies]
+tokio-test = "0.4"
