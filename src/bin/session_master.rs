@@ -924,6 +924,72 @@ async fn fetch_worker_bundle(
     Ok(extract_dir.join("runtime"))
 }
 
+/// The runtime this container is restricted to -- resolved once, at
+/// startup, before this process ever dials the callback listener (see
+/// resolve_worker_runtime_at_startup(), main()'s own caller). Holds both
+/// the extracted path and the hash it was resolved from: run_worker()
+/// needs the hash too, to reject a request that names a *different*
+/// worker_bundle than this container was actually launched to run.
+#[derive(Debug)]
+struct PinnedWorkerRuntime {
+    path: std::path::PathBuf,
+    sha256_hex: String,
+}
+
+static WORKER_RUNTIME: tokio::sync::OnceCell<Result<PinnedWorkerRuntime, String>> =
+    tokio::sync::OnceCell::const_new();
+
+/// Fetches and extracts this container's one worker_bundle before any
+/// callback dial-out, from `ACI_WORKER_RUNTIME_SHA256` and a dedicated,
+/// read-only-on-v4/assets/ credential the broker injects the same way it
+/// already injects ACI_CALLBACK_ADDR/_TOKEN (aci_executor.rs's own
+/// create_group_body(), attested-python-execution repo) -- deliberately
+/// NOT the per-request `storage_grant` a client's own encrypted request
+/// carries, which doesn't exist yet at this point in startup and
+/// wouldn't be this container's own call to trust anyway (see
+/// run_worker()'s own doc comment on why the request's own worker_bundle
+/// field is now only ever checked against this value, never used to
+/// select a fetch itself).
+///
+/// Both this hash and this credential are deliberately left as
+/// unresolved parameters in aci/arm-template-dev.json's own throwaway
+/// CCE-policy-generation template (same treatment as ACI_CALLBACK_ADDR/
+/// _TOKEN) -- "not CCE locked": which worker_bundle a fleet runs can
+/// change (a new worker-python-runtime release) without a CCE policy
+/// regeneration, the same property moving worker.py/storage.py out of
+/// this image's own build already bought for application-code changes.
+///
+/// Failing here is fatal, not a per-request error: a container that
+/// cannot resolve its own restricted runtime has nothing it could ever
+/// legitimately run, so main()'s own caller exits the process outright
+/// rather than dialing back with nothing to offer.
+async fn resolve_worker_runtime_at_startup() -> Result<PinnedWorkerRuntime, String> {
+    let sha256_hex = env_or("ACI_WORKER_RUNTIME_SHA256", "");
+    if sha256_hex.is_empty() {
+        return Err("ACI_WORKER_RUNTIME_SHA256 is not set".to_string());
+    }
+
+    let get_env = |name: &str| -> Result<String, String> {
+        let value = env_or(name, "");
+        if value.is_empty() {
+            Err(format!("{name} is not set"))
+        } else {
+            Ok(value)
+        }
+    };
+    let grant = serde_json::json!({
+        "access_key_id": get_env("ACI_WORKER_RUNTIME_ACCESS_KEY_ID")?,
+        "secret_access_key": get_env("ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY")?,
+        "bucket": get_env("ACI_WORKER_RUNTIME_BUCKET")?,
+        "endpoint": get_env("ACI_WORKER_RUNTIME_ENDPOINT")?,
+        "region": env_or("ACI_WORKER_RUNTIME_REGION", "auto"),
+        "asset_prefix": env_or("ACI_WORKER_RUNTIME_ASSET_PREFIX", "v4/assets/"),
+    });
+
+    let path = fetch_worker_bundle(&grant, &sha256_hex).await?;
+    Ok(PinnedWorkerRuntime { path, sha256_hex: sha256_hex.to_ascii_lowercase() })
+}
+
 #[derive(serde::Serialize)]
 struct WorkerFailure<'a> {
     ok: bool,
@@ -1122,35 +1188,63 @@ async fn bwrap_available() -> bool {
 /// nested dev environment, not ACI's own narrower procfs-specific
 /// restriction described above.) Built against bubblewrap's own real,
 /// verified `--help` output, not guessed.
+/// Pure comparison, split out of run_worker() purely so it's unit-testable
+/// without needing WORKER_RUNTIME's own OnceCell populated (that requires a
+/// real startup fetch) -- see run_worker()'s own comment for what this
+/// enforces and why. `Ok(())` covers both a matching hash and no
+/// `worker_bundle` field at all in the request.
+fn check_requested_worker_bundle_matches_pinned(
+    request: &serde_json::Value,
+    pinned_sha256_hex: &str,
+) -> Result<(), String> {
+    let Some(requested) = request
+        .get("worker_bundle")
+        .and_then(|v| v.get("sha256"))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(());
+    };
+    if requested.to_ascii_lowercase() != pinned_sha256_hex {
+        return Err(format!(
+            "request named worker_bundle {requested:?}, but this container is restricted to {pinned_sha256_hex:?}"
+        ));
+    }
+    Ok(())
+}
+
 async fn run_worker(request: &serde_json::Value, timeout: Duration) -> serde_json::Value {
     let payload = match serde_json::to_vec(request) {
         Ok(p) => p,
         Err(e) => return worker_failure(&format!("could not serialize request: {e}")),
     };
 
-    // Mandatory: this image carries no Python and no baked-in
-    // worker.py/storage.py at all, so a request with no `worker_bundle`
-    // field has nothing this binary could possibly run -- refused
-    // outright, the same "unverifiable/absent code does not get
-    // executed" posture install.sh's own setup-script check already
-    // uses. See fetch_worker_bundle()'s own doc comment for the
-    // fetch/verify/extract this resolves.
-    let Some(sha256_hex) = request
-        .get("worker_bundle")
-        .and_then(|v| v.get("sha256"))
-        .and_then(|v| v.as_str())
-    else {
-        return worker_failure(
-            "request carries no worker_bundle -- this image has no baked-in default to fall back to",
-        );
+    // This container's worker_bundle was already fetched, verified, and
+    // extracted at startup (resolve_worker_runtime_at_startup(), before
+    // this process ever dialed the callback listener) -- run_worker()
+    // itself no longer fetches anything, and no longer trusts a
+    // per-request storage_grant to do so. A request's own `worker_bundle`
+    // field, if present, is only ever checked against this container's
+    // own pinned hash and refused on mismatch -- it can no longer select
+    // *which* bundle runs, only confirm the caller and this container
+    // agree on it. Omitting the field entirely is fine: there is only
+    // ever one bundle this container can run regardless.
+    let pinned = match WORKER_RUNTIME.get() {
+        Some(Ok(pinned)) => pinned,
+        Some(Err(e)) => {
+            return worker_failure(&format!(
+                "this container's own worker_bundle failed to resolve at startup: {e}"
+            ))
+        }
+        None => {
+            return worker_failure(
+                "this container's own worker_bundle was never resolved -- run_worker() called before startup finished",
+            )
+        }
     };
-    let Some(storage_grant) = request.get("storage_grant") else {
-        return worker_failure("worker_bundle given but request carries no storage_grant");
-    };
-    let worker_bundle_path = match fetch_worker_bundle(storage_grant, sha256_hex).await {
-        Ok(path) => path,
-        Err(e) => return worker_failure(&format!("could not resolve worker_bundle: {e}")),
-    };
+    if let Err(e) = check_requested_worker_bundle_matches_pinned(request, &pinned.sha256_hex) {
+        return worker_failure(&e);
+    }
+    let worker_bundle_path = pinned.path.clone();
 
     // kill_on_drop: without this, dropping `child` (which is exactly what
     // happens below when our own tokio::time::timeout fires and abandons
@@ -1873,6 +1967,21 @@ async fn aci_callback_handler() -> Result<(), SessionError> {
 #[cfg(feature = "aci-attestation")]
 async fn run_aci_callback_mode() {
     log::info!("session-master (aci-attestation build) starting");
+
+    // Resolved before dialing the callback listener at all: a container
+    // that can't fetch/verify its own restricted worker_bundle has
+    // nothing it could legitimately run, so this fails the whole process
+    // before ever presenting a token -- see resolve_worker_runtime_at_startup()'s
+    // own doc comment.
+    let resolved = WORKER_RUNTIME
+        .get_or_init(resolve_worker_runtime_at_startup)
+        .await;
+    if let Err(e) = resolved {
+        log::error!("could not resolve this container's own worker_bundle: {e}");
+        std::process::exit(1);
+    }
+    log::info!("worker_bundle resolved and extracted at startup");
+
     if let Err(e) = aci_callback_handler().await {
         log::error!("aci session failed: {e}");
         std::process::exit(1);
@@ -1985,5 +2094,46 @@ mod worker_bundle_tests {
         assert_eq!(resolved, extract_dir.join("runtime"));
 
         tokio::fs::remove_dir_all(&extract_dir).await.unwrap();
+    }
+
+    use super::resolve_worker_runtime_at_startup;
+
+    #[tokio::test]
+    async fn startup_resolution_fails_closed_when_the_hash_env_var_is_unset() {
+        std::env::remove_var("ACI_WORKER_RUNTIME_SHA256");
+        let err = resolve_worker_runtime_at_startup().await.unwrap_err();
+        assert!(err.contains("ACI_WORKER_RUNTIME_SHA256 is not set"), "{err}");
+    }
+
+    use super::check_requested_worker_bundle_matches_pinned;
+
+    #[test]
+    fn matching_worker_bundle_is_accepted() {
+        let pinned = "a".repeat(64);
+        let request = serde_json::json!({ "worker_bundle": { "sha256": pinned } });
+        assert!(check_requested_worker_bundle_matches_pinned(&request, &pinned).is_ok());
+    }
+
+    #[test]
+    fn matching_is_case_insensitive() {
+        let pinned = "a".repeat(64);
+        let request = serde_json::json!({ "worker_bundle": { "sha256": "A".repeat(64) } });
+        assert!(check_requested_worker_bundle_matches_pinned(&request, &pinned).is_ok());
+    }
+
+    #[test]
+    fn mismatched_worker_bundle_is_refused() {
+        let pinned = "a".repeat(64);
+        let requested = "b".repeat(64);
+        let request = serde_json::json!({ "worker_bundle": { "sha256": requested } });
+        let err = check_requested_worker_bundle_matches_pinned(&request, &pinned).unwrap_err();
+        assert!(err.contains("restricted to"), "{err}");
+    }
+
+    #[test]
+    fn a_request_with_no_worker_bundle_field_at_all_is_accepted() {
+        let pinned = "a".repeat(64);
+        let request = serde_json::json!({});
+        assert!(check_requested_worker_bundle_matches_pinned(&request, &pinned).is_ok());
     }
 }
