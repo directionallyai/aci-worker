@@ -31,14 +31,18 @@ externally now, rather than owning a local copy of the wire framing.
 4. Encrypt the result, write it back over the same session, exit. One
    container, one session, then torn down by whatever launched it.
 
-`worker_bundle` names a zip (`worker.py`+`storage.py`) by its own SHA-256;
-Python's own `zipimport` resolves it via `PYTHONPATH`, nothing is ever
-extracted to disk. Nothing Python-shaped is baked into this image at
-all -- every session supplies its own bundle. (The canonical source of
-that bundle is a separate, private repo's own `worker.py`/`storage.py`,
-published to the object store by content hash at that service's own
-startup; this repo has no opinion on what's in it beyond verifying the
-hash matches.)
+`worker_bundle` names a tarball by its own SHA-256 --
+[worker-python-runtime](https://github.com/directionallyai/worker-python-runtime)'s
+own `runtime.tar.gz`, a self-contained Python interpreter, its
+dependencies, and `worker.py`/`storage.py` themselves, extracted to a
+fresh, hash-named `/tmp` directory and run via its own `runtime` entry
+point. Nothing Python-shaped is baked into this image at all -- no
+interpreter, no wheels, no worker.py/storage.py, not even as a fallback:
+a request with no `worker_bundle` is refused outright. (The canonical
+source of that tarball is worker-python-runtime's own repo, republished
+to the object store by content hash at a separate, private broker
+service's own startup; this repo has no opinion on what's in it beyond
+verifying the hash matches.)
 
 ## Building
 
