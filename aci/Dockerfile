@@ -10,17 +10,22 @@
 # no business-sensitive content of its own; the broker/launcher side does
 # (deployment topology, credential minting, MAA verification wiring).
 #
-# worker.py and storage.py are NOT baked into this image at all, unlike an
-# earlier revision of this Dockerfile (attested-python-execution's own git
-# history, before this repo existed) that did. Every session now names a
-# `worker_bundle` by content hash in its own request; session_master's own
-# fetch_worker_bundle() fetches, verifies, and runs it via Python's own
-# zipimport (PYTHONPATH-mounted, never extracted) instead -- see that
-# function's own doc comment. The canonical source of worker.py/storage.py
-# is backend's own packages/api/assets/setup/{worker,storage}.py now
-# (a separate, private repo), published to CAS at backend startup
-# (ensure_worker_bundle(), that repo's own main.rs) -- this image has no
-# reason to carry a copy of either file.
+# No Python at all is baked into this image -- not the interpreter, not
+# worker.py/storage.py, not their dependencies. Every session names a
+# `worker_bundle` by content hash in its own request; session_master's
+# own fetch_worker_bundle() fetches, verifies, and extracts a
+# self-contained runtime tarball (worker-python-runtime, a separate,
+# public repo -- interpreter, dependencies, and worker.py/storage.py
+# themselves, all inside it) and execs its own `runtime` entry point
+# directly. An earlier revision of this Dockerfile baked worker.py/
+# storage.py into /opt/worker/ directly; a later one dropped just those
+# two but kept a python:3.12-alpine base with the dependency wheels
+# pip-installed, fetching only a zip of the two files per session
+# (zipimport, PYTHONPATH-mounted). Neither survives here: this image now
+# carries none of it, on the strength of worker-python-runtime's own
+# tarball being genuinely self-contained (confirmed via a real relocated
+# build, run cold, outside any Python installation this image would
+# otherwise have provided).
 #
 # A container built from this image is meant to be launched fresh per h2
 # attested-session, accept exactly one client, run exactly one request,
@@ -52,15 +57,19 @@ RUN touch src/lib.rs src/bin/session_master.rs \
     && cargo build --release --features aci-attestation --locked
 
 # ---------------------------------------------------------------------------
-# runtime stage: python:3.12-alpine, not python:3.12-slim -- has to stay
-# musl/Alpine to match the build stage's own target (rust:*-alpine3.22).
-# A glibc runtime image would fail to even start this binary. libgcc is
-# required too -- python:3.12-alpine doesn't ship it by default, and a
-# Rust binary needs libgcc_s for unwinding; confirmed the hard way, via a
-# real container run failing with "Error relocating session_master:
+# runtime stage: bare alpine:3.22, not python:3.12-alpine -- this image
+# runs no Python of its own at all anymore (see this file's own header
+# comment), so a Python base image would just be unused weight in the
+# CCE-measured TCB, exactly what moving the interpreter into
+# worker-python-runtime's own fetched bundle was for. Still has to stay
+# musl/Alpine to match the build stage's own target (rust:*-alpine3.22)
+# -- a glibc runtime image would fail to even start this binary. libgcc
+# is required too -- Alpine doesn't ship it by default, and a Rust binary
+# needs libgcc_s for unwinding; confirmed the hard way, via a real
+# container run failing with "Error relocating session_master:
 # _Unwind_Resume: symbol not found" before this line was added.
 # ---------------------------------------------------------------------------
-FROM python:3.12-alpine
+FROM alpine:3.22
 
 RUN apk add --no-cache \
     ca-certificates \
@@ -83,50 +92,21 @@ RUN apk add --no-cache \
 # same gap, same as libgcc/ca-certificates above are here for the master
 # binary and TLS, not one caller in particular.
 
-# worker.py's own dial-out to the private repo's REGISTER_CALLBACK_PATH
-# mechanism (make_local_callback(), the worker_bundle's own worker.py --
-# backend repo) needs a real h2c client and AES-GCM. Installed as real,
-# ordinary dependencies of this image -- the worker_bundle's own worker.py
-# has no control over which Python environment it lands in (fetched fresh
-# per session), so it can't bring its own wheels the way agent.py does
-# for the same libraries (backend repo, H2_WHEELS) -- these have to
-# already be present in the environment it's dropped into.
+# worker.py's own dependencies (h2/hpack/hyperframe/tlslite-ng for its
+# dial-out to backend's REGISTER_CALLBACK_PATH mechanism, cryptography
+# for submitted worker code to import) travel inside worker-python-
+# runtime's own fetched tarball now, alongside worker.py/storage.py
+# themselves -- nothing for this image to pip-install.
 #
-# cryptography==50.0.1: not this image's own plumbing (unlike the four
-# above) -- available for submitted worker code to import, the same way
-# any other stdlib/site-packages module already is inside run_worker()'s
-# bwrap sandbox. A prebuilt musllinux_1_2 wheel (cp39-abi3, so it covers
-# this image's cp312) exists on PyPI for this version, confirmed via the
-# package's own PyPI JSON API before pinning it -- no Rust toolchain or
-# openssl-dev needed at build time to compile it from source.
-RUN pip install --no-cache-dir \
-    hyperframe==6.1.0 \
-    hpack==4.2.0 \
-    h2==4.4.1 \
-    tlslite-ng==0.8.2 \
-    cryptography==50.0.1 \
-    && true
-# UNVERIFIED against a real build of this image: run_worker()'s own bwrap
-# invocation (session_master.rs) binds `/usr` read-only but not
-# `/usr/local` -- that's already relied on today for CPython/libpython
-# itself to be reachable inside the sandbox at all (see run_worker()'s own
-# doc comment), on the strength of this being Alpine's own apk-packaged
-# python3 (installs under /usr/lib/python3.*, not /usr/local the way a
-# from-source build would). This pip install should land these packages
-# in that same /usr/lib/python3.*/site-packages/ tree for the same reason
-# -- not confirmed against a real build yet. If PEP 668's
-# "externally-managed-environment" guard ever blocks this pip invocation
-# on a newer Alpine python3 package, that's the fix to reach for
-# (--break-system-packages), not assumed needed here without hitting it.
-
 # bubblewrap: a real, maintained system package, confining run_worker()'s
-# subprocess via unprivileged user/mount/pid namespaces against this
-# image's own python3, no separate guest image to package. Azure ACI's
-# own node kernel lacks CONFIG_SECURITY_LANDLOCK entirely (confirmed
-# live), which is why this is bwrap and not a Landlock-based sandbox --
-# user namespaces are the confinement primitive confirmed available on
-# this platform instead. See run_worker()'s own doc comment
-# (session_master.rs) for the full story.
+# subprocess via unprivileged user/mount/pid namespaces around whatever
+# interpreter the fetched worker_bundle brings with it, no separate guest
+# image to package. Azure ACI's own node kernel lacks
+# CONFIG_SECURITY_LANDLOCK entirely (confirmed live), which is why this
+# is bwrap and not a Landlock-based sandbox -- user namespaces are the
+# confinement primitive confirmed available on this platform instead.
+# See run_worker()'s own doc comment (session_master.rs) for the full
+# story.
 RUN apk add --no-cache bubblewrap
 
 # The unprivileged identity worker.py actually runs as -- see
