@@ -3,16 +3,34 @@
   "contentVersion": "1.0.0.0",
   "metadata": {
   "_comment": [
-    "Confidential ACI container group for aci_session_master (this",
-    "directory's own Dockerfile) -- one h2 attested-session per launch,",
-    "then the process exits and Azure tears the group down. Shape copied",
-    "from Microsoft's own real tutorial template",
+    "Throwaway ARM template used ONLY to generate a CCE policy via",
+    "`az confcom acipolicygen` -- never actually deployed. confcom only",
+    "cares about the container's image/commands/env-var *rules*, not how",
+    "the real group gets created (no containerGroupProfiles support in",
+    "confcom at all) -- so this mirrors infra's own",
+    "aci-session-worker-profile.tf `local.aci_session_worker_container`",
+    "definition (that file's own header comment is the authoritative",
+    "source for all of this) rather than describing a deployment of its",
+    "own. Shape copied from Microsoft's own real tutorial template",
     "(container-instances-tutorial-deploy-confidential-containers-cce-arm,",
     "raw.githubusercontent.com/microsoft/confidential-container-demos/",
     "main/hello-world/ACI/arm-template.json) -- the `sku`/",
     "`confidentialComputeProperties` pair is what turns an ordinary",
     "container group into a confidential one; without them the group",
     "deploys but nothing in it validates.",
+    "",
+    "Launch-and-callback design, not the old public-IP/inbound-listener",
+    "one this file used to describe: the container has no inbound",
+    "listener of its own at all -- it dials OUT to attested-python-",
+    "execution's own callback listener over a private VNet path and",
+    "presents ACI_CALLBACK_TOKEN. The one declared port (12345, on both",
+    "the container and `ipAddress`) is an inert mandatory-port workaround",
+    "-- ACI rejects any group with an IP and zero declared ports",
+    "(MissingIpAddressPorts); nothing ever listens on it. `restartPolicy`",
+    "is hardcoded to Never, not a parameter -- see session_master.rs's own",
+    "module doc comment for why Always/OnFailure would silently turn 'run",
+    "one session and exit' into an unbounded restart loop reusing the",
+    "same confidential container.",
     "",
     "`image` defaults to a placeholder -- resolve-image-digest.sh fills in",
     "the real `ghcr.io/directionallyai/aci-worker/aci-session-worker@sha256:...`",
@@ -25,22 +43,34 @@
     "",
     "`ccePolicy` starts empty -- `az confcom acipolicygen -a arm-template.json`",
     "fills it in (and prints its own SHA-256, the value",
-    "update-policy-hashes.sh/agent.py's AZURE_ACI_EXPECTED_POLICY_HASH",
-    "needs) once `image` above is a real, resolved digest.",
+    "aci-session-worker-profile.tf's own",
+    "aci_session_worker_expected_cce_policy_hash output needs) once",
+    "`image` above is a real, resolved digest.",
     "",
-    "restartPolicy is hardcoded to Never, not a parameter -- see",
-    "aci_session_master.rs's own module doc comment for why `Always`/",
-    "`OnFailure` would silently turn 'run one session and exit' into an",
-    "unbounded restart loop reusing the same container. Not something a",
-    "caller of this template should be able to override.",
+    "Five env vars below are DELIBERATELY left as unresolved",
+    "`[parameters('...')]` references with no default and NO --parameters",
+    "file passed to acipolicygen -- ACI_CALLBACK_ADDR/_TOKEN/_GROUP_NAME/",
+    "WORKER_EXECUTION_OPTIONS (real per-session values aci_executor.rs's",
+    "own create_group() injects at instance-creation time, never declared",
+    "on the real profile's own container) and STAYUP_AFTER (a debug-only",
+    "value attester-service.tf sets on itself and aci_executor.rs forwards",
+    "to the launched worker, same treatment). confcom only emits a",
+    "wildcard (re2, .*) env rule when the template value is still an",
+    "unresolved parameter reference at generation time -- resolving any of",
+    "these to a literal would pin an exact-string-match rule instead,",
+    "which would reject every real launch outright since no two sessions",
+    "share the same callback address/token/group name. Real incident (see",
+    "aci-session-worker-profile.tf's own header comment): an env var",
+    "missing from this template entirely isn't a launch failure, it's a",
+    "silent drop before the container ever starts",
+    "(allow_environment_variable_dropping := true) -- STAYUP_AFTER was",
+    "originally left out here and session_master.rs never saw it, no error",
+    "anywhere. Keep all five even though none has a real default.",
     "",
-    "Public IP, not a private VNET endpoint -- deliberate for now, not an",
-    "oversight: the h2 attested-session protocol already assumes a",
-    "hostile network between client and container (that's the whole point",
-    "of the handshake), so the trust boundary here is attestation, not",
-    "network reachability. Worth revisiting if there's ever a reason to",
-    "hide the container's existence entirely, not because a public IP",
-    "weakens what's actually being verified."
+    "AZURE_ACI_MAA_ENDPOINT is different: it's a real, static value (the",
+    "same shared MAA instance attester-service itself already uses),",
+    "never per-session -- declared here with its real value rather than",
+    "left as a parameter."
   ]
   },
   "parameters": {
@@ -65,45 +95,55 @@
         "description": "Container image to deploy, pinned by digest -- resolve-image-digest.sh's own output. Never a mutable tag: the CCE policy generated against this template bakes this exact digest into its own `id`/`layers` fields."
       }
     },
-    "port": {
-      "type": "int",
-      "defaultValue": 8081,
-      "metadata": {
-        "description": "Matches AZURE_ACI_PORT's own default in aci_session_master.rs -- the single TCP port the h2 attested-session client connects to."
-      }
-    },
     "cpuCores": {
       "type": "int",
       "defaultValue": 1,
       "metadata": {
-        "description": "One session, one -e/repl call -- not a long-lived service under sustained load."
+        "description": "Matches aci-session-worker-profile.tf's own local.aci_session_worker_container resources.requests.cpu."
       }
     },
     "memoryInGb": {
-      "type": "int",
-      "defaultValue": 1,
+      "type": "string",
+      "defaultValue": "1.5",
       "metadata": {
-        "description": "The number of CPU cores to allocate to the container."
+        "description": "Matches aci-session-worker-profile.tf's own local.aci_session_worker_container resources.requests.memoryInGB."
       }
     },
     "maaEndpoint": {
       "type": "string",
+      "defaultValue": "sharedeus.eus.attest.azure.net",
       "metadata": {
-        "description": "AZURE_ACI_MAA_ENDPOINT -- e.g. sharedeus2.eus2.attest.azure.net. No default: get_maa_token() refuses to run against an unpinned MAA instance the same way agent.py's own AZURE_ACI_MAA_EXPECTED_ISSUER does on the verifying side."
+        "description": "AZURE_ACI_MAA_ENDPOINT -- bare hostname, not a URL (get_maa_token() builds `https://{endpoint}/attest/...` itself). Matches aci-session-worker-profile.tf's own real, static value: the shared MAA instance attester-service itself already uses, never per-session."
       }
     },
-    "acceptTimeoutSecs": {
-      "type": "int",
-      "defaultValue": 120,
+    "callbackAddr": {
+      "type": "string",
       "metadata": {
-        "description": "AZURE_ACI_ACCEPT_TIMEOUT_SECS -- how long the container waits for its one client connection before exiting."
+        "description": "ACI_CALLBACK_ADDR -- real per-session value, never resolved here. See this file's metadata comment for why it must stay an unresolved parameter reference."
       }
     },
-    "workerTimeoutSecs": {
-      "type": "int",
-      "defaultValue": 300,
+    "callbackToken": {
+      "type": "string",
       "metadata": {
-        "description": "AZURE_ACI_WORKER_TIMEOUT_SECS -- how long worker.py gets to finish running the submitted -e/repl code."
+        "description": "ACI_CALLBACK_TOKEN -- real per-session value, never resolved here. See this file's metadata comment for why it must stay an unresolved parameter reference."
+      }
+    },
+    "groupName": {
+      "type": "string",
+      "metadata": {
+        "description": "ACI_GROUP_NAME -- real per-session value, never resolved here. See this file's metadata comment for why it must stay an unresolved parameter reference."
+      }
+    },
+    "workerExecutionOptions": {
+      "type": "string",
+      "metadata": {
+        "description": "WORKER_EXECUTION_OPTIONS -- real per-session value (e.g. \"shared\"), never resolved here. See this file's metadata comment for why it must stay an unresolved parameter reference."
+      }
+    },
+    "stayupAfter": {
+      "type": "string",
+      "metadata": {
+        "description": "STAYUP_AFTER -- debug-only value, never resolved here. See this file's metadata comment for the real incident this env var caused when it was left out of an earlier version of this template entirely."
       }
     }
   },
@@ -119,20 +159,22 @@
         },
         "containers": [
           {
-            "name": "[parameters('name')]",
+            "name": "executor",
             "properties": {
               "image": "[parameters('image')]",
               "ports": [
                 {
-                  "port": "[parameters('port')]",
+                  "port": 12345,
                   "protocol": "TCP"
                 }
               ],
               "environmentVariables": [
-                { "name": "AZURE_ACI_PORT", "value": "[string(parameters('port'))]" },
                 { "name": "AZURE_ACI_MAA_ENDPOINT", "value": "[parameters('maaEndpoint')]" },
-                { "name": "AZURE_ACI_ACCEPT_TIMEOUT_SECS", "value": "[string(parameters('acceptTimeoutSecs'))]" },
-                { "name": "AZURE_ACI_WORKER_TIMEOUT_SECS", "value": "[string(parameters('workerTimeoutSecs'))]" }
+                { "name": "ACI_CALLBACK_ADDR", "value": "[parameters('callbackAddr')]" },
+                { "name": "ACI_CALLBACK_TOKEN", "value": "[parameters('callbackToken')]" },
+                { "name": "ACI_GROUP_NAME", "value": "[parameters('groupName')]" },
+                { "name": "WORKER_EXECUTION_OPTIONS", "value": "[parameters('workerExecutionOptions')]" },
+                { "name": "STAYUP_AFTER", "value": "[parameters('stayupAfter')]" }
               ],
               "resources": {
                 "requests": {
@@ -147,10 +189,10 @@
         "osType": "Linux",
         "restartPolicy": "Never",
         "ipAddress": {
-          "type": "Public",
+          "type": "Private",
           "ports": [
             {
-              "port": "[parameters('port')]",
+              "port": 12345,
               "protocol": "TCP"
             }
           ]
@@ -158,10 +200,5 @@
       }
     }
   ],
-  "outputs": {
-    "containerIPv4Address": {
-      "type": "string",
-      "value": "[reference(resourceId('Microsoft.ContainerInstance/containerGroups', parameters('name'))).ipAddress.ip]"
-    }
-  }
+  "outputs": {}
 }
