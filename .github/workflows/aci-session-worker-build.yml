@@ -1,7 +1,7 @@
 name: Build and Push ACI Session Worker Image
 
 # Publishes the Azure Confidential ACI variant of the worker image --
-# aci/arm-template.json's own `image` parameter points at whatever this
+# aci/arm-template-dev.json's own `image` parameter points at whatever this
 # publishes, by digest (aci/resolve-image-digest.sh resolves it).
 # Genuinely single-repo build context now (this repo's own root; nothing
 # reaches outside it) -- split out of attested-python-execution (a

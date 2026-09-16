@@ -56,10 +56,14 @@ docker build -f aci/Dockerfile -t aci-session-worker .
 
 ## Deploying
 
-`aci/arm-template.json` is the throwaway ARM template `az confcom
+`aci/arm-template-dev.json` is the throwaway ARM template `az confcom
 acipolicygen` generates a CCE policy against -- see that file's own
 comments, and the consuming Terraform (a separate, private infra repo)
-for how the resulting policy actually gets deployed.
+for how the resulting policy actually gets deployed. Named per-environment
+(only `dev` exists so far) because the image digest, MAA endpoint, and
+resource sizing it mirrors are themselves per-environment in that
+Terraform; a future second environment with different values would need
+its own `arm-template-<env>.json` rather than sharing this one.
 `aci/resolve-image-digest.sh` resolves the currently-published image tag
 to the exact digest that policy generation and the real container-group
 launch both need to agree on.

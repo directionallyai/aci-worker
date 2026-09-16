@@ -13,7 +13,7 @@
 # set to public once, manually, after aci-session-worker-build.yml's
 # first successful push.
 #
-# Never resolves to a tag -- see arm-template.json's own comment for why
+# Never resolves to a tag -- see arm-template-dev.json's own comment for why
 # the CCE policy has to be generated against the same immutable digest
 # that actually gets deployed, not a tag that could move out from under
 # either one independently.
