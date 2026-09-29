@@ -111,13 +111,11 @@ jobs:
             exit 1
           fi
 
-      # TEMPORARY, this branch only: pushes to a throwaway :repro-test-<sha>
-      # tag instead of :dev/:<sha> while this reproducibility prototype is
-      # being validated, so a test run never overwrites the real :dev tag
-      # anything might already be pulling. Restore the :dev/:<sha> tags
-      # before merging (keep rewrite-timestamp=true -- see the step above
-      # for why it has to be reached via `outputs:`, not `push:`/`tags:`).
-      - name: Build and push Docker image (TEST TAG, not :dev)
+      # `outputs:` name= accepts a comma-separated list for multiple tags in
+      # one push, quoted so buildx doesn't mistake the tag-list commas for
+      # the outer type=image,name=...,push=...  key separators -- confirmed
+      # live this session that this exact form parses and pushes both tags.
+      - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -126,6 +124,6 @@ jobs:
           sbom: false
           build-args: |
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:repro-test-${{ github.sha }},push=true,rewrite-timestamp=true
+          outputs: 'type=image,"name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}",push=true,rewrite-timestamp=true'
           cache-from: type=gha
           cache-to: type=gha,mode=max
