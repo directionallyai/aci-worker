@@ -32,18 +32,87 @@
 # and exit -- Azure/the launching broker then tears the container group
 # down. See src/bin/session_master.rs's own module doc comment for the
 # full protocol and the master/worker process split this image runs.
+#
+# Ubuntu, not Alpine -- this was a deliberate tradeoff, not a default.
+# The previous Alpine/musl revision of this file kept the CCE-measured
+# TCB deliberately small (see the runtime-stage comment it used to carry,
+# preserved in git history); Ubuntu's own base is meaningfully bigger.
+# Traded for it: apk has no equivalent to apt's own snapshot mirrors
+# (below), so a bare `apk add` always resolves against whatever Alpine's
+# *live* package index currently holds at build time, no matter how
+# precisely the base image itself is pinned -- confirmed the actual,
+# root-caused source of the one real reproducibility bug found while
+# making directionallyai/linuxkit-attestable-ami's own Azure CVM image
+# reproducible (extra/azure-cve-attest's Alpine "mirror" stage). Follows
+# that repo's extra/build-attest-api/Dockerfile pattern directly: an
+# amd64 Ubuntu digest (not a floating tag), apt pointed at a fixed-date
+# snapshot.ubuntu.com mirror instead of the live archive, and a
+# checksum-verified rustup install pinned to an exact toolchain version
+# (not `apt install rustc`, which floats the same way `apk add` does, and
+# not a `rust:*` base image, which is itself Alpine- or Debian-slim-based
+# upstream with its own separate, unpinned package set).
+ARG SOURCE_DATE_EPOCH=1788613323
+
+FROM ubuntu:24.04@sha256:a61567bd31828687156d735ea8eb01ba4e37636e225dd6a48ba94136a70d9d61 AS base
+ARG SOURCE_DATE_EPOCH
+ENV DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    snapshot="$(/bin/bash -euc "printf \"%(%Y%m%dT%H%M%SZ)T\n\" \"${SOURCE_DATE_EPOCH}\"")" && \
+    sed -i -e '/Types: deb/ a\Snapshot: true' /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i "s/archive.ubuntu.com\/ubuntu\//snapshot.ubuntu.com\/ubuntu\/${snapshot}/" /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i "s/security.ubuntu.com\/ubuntu\//snapshot.ubuntu.com\/ubuntu\/${snapshot}/" /etc/apt/sources.list.d/ubuntu.sources && \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' >/etc/apt/apt.conf.d/keep-cache && \
+    apt-get install --update -o Acquire::Check-Valid-Until=false -o Acquire::https::Verify-Peer=false -y \
+      ca-certificates libgcc-s1 bash bubblewrap && \
+    rm -rf /var/log/* /var/cache/ldconfig/aux-cache
 
 # ---------------------------------------------------------------------------
-# session_master build stage: rust:1.93-alpine3.22, matching this crate's
-# own rust-version pin (Cargo.toml). No tpm2-tss packages needed: session_
-# master's own SEV-SNP evidence comes from /dev/sev-guest via the `sev`
-# crate (aci_attestation module), never through tpm2-tss/NitroTPM-Tools.
+# session_master build stage: rustup-installed toolchain, pinned to
+# Cargo.toml's own rust-version, against the same snapshot the base stage
+# already uses. No tpm2-tss packages needed: session_master's own SEV-SNP
+# evidence comes from /dev/sev-guest via the `sev` crate (aci_attestation
+# module), never through tpm2-tss/NitroTPM-Tools.
 # ---------------------------------------------------------------------------
-FROM rust:1.93-alpine3.22 AS build
+FROM base AS build
+ARG SOURCE_DATE_EPOCH
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update -o Acquire::Check-Valid-Until=false && \
+    apt-get install -y --no-install-recommends build-essential curl && \
+    rm -rf /var/log/* /var/cache/ldconfig/aux-cache
 
-RUN apk add --no-cache \
-    build-base \
-    && true
+# .../archive/<rustup-version>/... is rustup's own immutable, versioned
+# release path (not the floating "current" dist/ bootstrapper), checksum
+# verified against the real value rustup publishes for it -- same pin
+# extra/build-attest-api/Dockerfile already uses in
+# linuxkit-attestable-ami, reused here rather than re-derived since it
+# names the same rustup release.
+ARG RUSTUP_VERSION=1.29.1
+ARG RUSTUP_INIT_SHA256=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
+RUN curl -fsSL "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init" -o /tmp/rustup-init && \
+    echo "${RUSTUP_INIT_SHA256}  /tmp/rustup-init" | sha256sum -c - && \
+    chmod +x /tmp/rustup-init && \
+    /tmp/rustup-init -y --no-modify-path --default-toolchain 1.93.1 --profile minimal
+ENV PATH=/root/.cargo/bin:$PATH
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+# Cargo.lock pins every dependency version already (cargo build --locked
+# below fails outright on drift instead of silently re-resolving), but
+# incremental compilation caches are keyed by things like mtimes and
+# prior build state, not a pure function of the source alone -- a real
+# determinism risk to leave on even though it is off by default for a
+# --release profile build; irrelevant for speed in a from-scratch
+# container build anyway.
+ENV CARGO_INCREMENTAL=0
+# Without this, rustc embeds this build's own absolute paths
+# (/root/.cargo/registry/..., /app/src/...) into debug info and
+# panic!()'s own file!() output -- consistent build-to-build only
+# because every build happens inside this exact same pinned image at
+# this exact same path, an implicit assumption this removes instead of
+# relying on it silently holding (same reasoning
+# extra/build-attest-api/Dockerfile's own RUSTFLAGS already documents).
+ENV RUSTFLAGS="--remap-path-prefix=/root/.cargo=/cargo --remap-path-prefix=/app=/src"
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
@@ -57,65 +126,19 @@ RUN touch src/lib.rs src/bin/session_master.rs \
     && cargo build --release --features aci-attestation --locked
 
 # ---------------------------------------------------------------------------
-# runtime stage: bare alpine:3.22, not python:3.12-alpine -- this image
-# runs no Python of its own at all anymore (see this file's own header
-# comment), so a Python base image would just be unused weight in the
-# CCE-measured TCB, exactly what moving the interpreter into
-# worker-python-runtime's own fetched bundle was for. Still has to stay
-# musl/Alpine to match the build stage's own target (rust:*-alpine3.22)
-# -- a glibc runtime image would fail to even start this binary. libgcc
-# is required too -- Alpine doesn't ship it by default, and a Rust binary
-# needs libgcc_s for unwinding; confirmed the hard way, via a real
-# container run failing with "Error relocating session_master:
-# _Unwind_Resume: symbol not found" before this line was added.
+# final image
 # ---------------------------------------------------------------------------
-FROM alpine:3.22
-
-RUN apk add --no-cache \
-    ca-certificates \
-    libgcc \
-    bash \
-    && true
-# bash: not needed by anything in this repo -- Alpine's own busybox ash
-# already covers everything session_master.rs itself shells out to.
-# Present because run_worker()'s bwrap sandbox binds this image's own
-# /bin into every session (`--ro-bind /bin /bin`), and code running
-# *inside* that sandbox is free to assume whatever a normal Linux
-# environment offers -- confirmed live as a real gap: a reviewing agent
-# hit "/bin/sh: builtin: not found" on every terminal-tool command,
-# because its own tool layer expects to find a real /bin/bash the way its
-# native Ubuntu deployment always has one (Ubuntu's /bin/sh is dash, not
-# bash, but bash is still there as a separate binary) -- busybox ash has
-# no `builtin` keyword, so a fallback path that assumed one broke
-# completely instead of degrading. Not specific to that one workload
-# despite the repro: any sandboxed code with the same assumption hits the
-# same gap, same as libgcc/ca-certificates above are here for the master
-# binary and TLS, not one caller in particular.
-
-# worker.py's own dependencies (h2/hpack/hyperframe/tlslite-ng for its
-# dial-out to backend's REGISTER_CALLBACK_PATH mechanism, cryptography
-# for submitted worker code to import) travel inside worker-python-
-# runtime's own fetched tarball now, alongside worker.py/storage.py
-# themselves -- nothing for this image to pip-install.
-#
-# bubblewrap: a real, maintained system package, confining run_worker()'s
-# subprocess via unprivileged user/mount/pid namespaces around whatever
-# interpreter the fetched worker_bundle brings with it, no separate guest
-# image to package. Azure ACI's own node kernel lacks
-# CONFIG_SECURITY_LANDLOCK entirely (confirmed live), which is why this
-# is bwrap and not a Landlock-based sandbox -- user namespaces are the
-# confinement primitive confirmed available on this platform instead.
-# See run_worker()'s own doc comment (session_master.rs) for the full
-# story.
-RUN apk add --no-cache bubblewrap
+FROM base
 
 # The unprivileged identity worker.py actually runs as -- see
-# session_master.rs's own run_worker() doc comment. Fixed,
-# explicit uid/gid (not left to adduser's own allocation) so the Rust
-# binary's WORKER_UID/WORKER_GID defaults (10001) match without needing a
-# username lookup at runtime.
-RUN addgroup -S -g 10001 worker \
-    && adduser -S -D -H -s /sbin/nologin -u 10001 -G worker worker
+# session_master.rs's own run_worker() doc comment. Fixed, explicit
+# uid/gid (not left to useradd's own allocation) so the Rust binary's
+# WORKER_UID/WORKER_GID defaults (10001) match without needing a
+# username lookup at runtime -- same --system/no-home/no-login shape the
+# Alpine addgroup/adduser invocation this replaces already had.
+RUN groupadd --system --gid 10001 worker \
+    && useradd --system --no-create-home --no-user-group \
+         --gid worker --shell /usr/sbin/nologin --uid 10001 worker
 
 WORKDIR /app
 COPY --from=build /app/target/release/session_master /usr/local/bin/session_master
