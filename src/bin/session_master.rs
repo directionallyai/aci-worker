@@ -1010,7 +1010,7 @@ struct WorkerFailure<'a> {
 /// Cached via bwrap_available() -- see that function's own doc comment
 /// for the sandboxless fallback this drives on a host that fails it.
 ///
-/// `--ro-bind /bin /bin --ro-bind /lib /lib`: this only has to prove
+/// `--ro-bind /bin /bin --ro-bind /usr /usr --ro-bind /lib /lib`: this only has to prove
 /// bubblewrap can confine *something*, not run a real worker -- `true`
 /// needs both paths for the same reason the fetched runtime's own
 /// interpreter invocation needs `/usr`+`/lib` below (a
@@ -1051,6 +1051,7 @@ async fn bwrap_self_test() -> bool {
         .arg("--new-session")
         .arg("--dev").arg("/dev")
         .arg("--ro-bind").arg("/bin").arg("/bin")
+        .arg("--ro-bind").arg("/usr").arg("/usr")
         .arg("--ro-bind").arg("/lib").arg("/lib")
         .arg("--")
         .arg("true")
