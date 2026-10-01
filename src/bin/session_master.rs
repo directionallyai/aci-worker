@@ -1010,12 +1010,16 @@ struct WorkerFailure<'a> {
 /// Cached via bwrap_available() -- see that function's own doc comment
 /// for the sandboxless fallback this drives on a host that fails it.
 ///
-/// `--ro-bind /bin /bin --ro-bind /usr /usr --ro-bind /lib /lib`: this only has to prove
-/// bubblewrap can confine *something*, not run a real worker -- `true`
-/// needs both paths for the same reason the fetched runtime's own
-/// interpreter invocation needs `/usr`+`/lib` below (a
-/// dynamically-linked musl binary needs its loader readable, not just
-/// its own binary).
+/// `--ro-bind /bin /bin --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64`:
+/// this only has to prove bubblewrap can confine *something*, not run a
+/// real worker -- `true` needs these paths for the same reason the
+/// fetched runtime's own interpreter invocation needs them below (a
+/// dynamically-linked glibc binary needs its loader readable, not just
+/// its own binary). `/lib64` matters specifically: on Ubuntu `/lib` and
+/// `/lib64` are separate symlinks into `/usr`, and the ELF interpreter
+/// path is `/lib64/ld-linux-x86-64.so.2`, so binding `/lib` alone leaves
+/// every glibc binary (including `true`) failing exec with ENOENT and
+/// silently drives the sandboxless fallback below.
 ///
 /// No `--proc /proc`: confirmed live on a real Confidential ACI container
 /// that this specific flag is what fails there ("Can't mount proc on
@@ -1053,6 +1057,7 @@ async fn bwrap_self_test() -> bool {
         .arg("--ro-bind").arg("/bin").arg("/bin")
         .arg("--ro-bind").arg("/usr").arg("/usr")
         .arg("--ro-bind").arg("/lib").arg("/lib")
+        .arg("--ro-bind").arg("/lib64").arg("/lib64")
         .arg("--")
         .arg("true")
         .stdin(Stdio::null())
@@ -1086,6 +1091,9 @@ static BWRAP_AVAILABLE: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::con
 /// isolation everywhere -- run_worker() falls back to plain
 /// `python3 <script>` (no bubblewrap wrapper at all) rather than
 /// refusing to start.
+///
+/// (Superseded: there is no sandboxless fallback anymore. main() exits
+/// and run_worker() refuses when this is false, in every environment.)
 async fn bwrap_available() -> bool {
     *BWRAP_AVAILABLE.get_or_init(bwrap_self_test).await
 }
@@ -1272,7 +1280,16 @@ async fn run_worker(request: &serde_json::Value, timeout: Duration) -> serde_jso
     // interpreter's default sys.path.
     let bundle = worker_bundle_path.to_string_lossy().into_owned();
     let entry_point = worker_bundle_path.join("runtime").to_string_lossy().into_owned();
-    let mut command = if bwrap_available().await {
+    let sandboxed = bwrap_available().await;
+    // No sandboxless fallback, in any environment (dev included): the
+    // sandbox is the worker's isolation boundary, so a host that can't
+    // provide it fails loudly instead of silently running unconfined.
+    if !sandboxed {
+        return worker_failure(
+            "bubblewrap sandbox is unavailable on this host -- refusing to run the worker unsandboxed",
+        );
+    }
+    let mut command = {
         let mut c = Command::new("timeout");
         c.arg("-s").arg("9")
             .arg("-k").arg("5")
@@ -1285,6 +1302,7 @@ async fn run_worker(request: &serde_json::Value, timeout: Duration) -> serde_jso
             .arg("--ro-bind").arg("/bin").arg("/bin")
             .arg("--ro-bind").arg("/usr").arg("/usr")
             .arg("--ro-bind").arg("/lib").arg("/lib")
+            .arg("--ro-bind").arg("/lib64").arg("/lib64")
             .arg("--ro-bind").arg("/etc/ssl").arg("/etc/ssl")
             .arg("--ro-bind").arg("/etc/resolv.conf").arg("/etc/resolv.conf")
             .arg("--ro-bind").arg("/etc/hosts").arg("/etc/hosts")
@@ -1301,12 +1319,6 @@ async fn run_worker(request: &serde_json::Value, timeout: Duration) -> serde_jso
             .arg("--ro-bind").arg(&bundle).arg(&bundle)
             .arg("--")
             .arg(&entry_point);
-        c
-    } else {
-        let mut c = Command::new(&entry_point);
-        c.env("PYTHONDONTWRITEBYTECODE", "1")
-            .uid(worker_uid())
-            .gid(worker_gid());
         c
     };
     let mut child = match command
@@ -1996,11 +2008,11 @@ async fn main() {
     if bwrap_available().await {
         log::info!("bubblewrap self-test passed at startup -- worker.py will run sandboxed");
     } else {
-        log::warn!(
+        log::error!(
             "bubblewrap self-test (`bwrap ... -- true`) failed on this host -- \
-             falling back to running worker.py unsandboxed. Current goal is reaching \
-             attestation, not isolation -- see bwrap_available()'s own doc comment."
+             refusing to start (no unsandboxed fallback, in any environment)"
         );
+        std::process::exit(1);
     }
 
     #[cfg(feature = "aci-attestation")]
