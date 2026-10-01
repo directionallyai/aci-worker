@@ -1981,6 +1981,19 @@ async fn aci_callback_handler() -> Result<(), SessionError> {
 async fn run_aci_callback_mode() {
     log::info!("session-master (aci-attestation build) starting");
 
+    // Checked right after the build-variant line above (which CI greps
+    // for) so a host without a working sandbox still identifies its build,
+    // then fails loudly rather than running unconfined.
+    if bwrap_available().await {
+        log::info!("bubblewrap self-test passed at startup -- worker.py will run sandboxed");
+    } else {
+        log::error!(
+            "bubblewrap self-test (`bwrap ... -- true`) failed on this host -- \
+             refusing to start (no unsandboxed fallback, in any environment)"
+        );
+        std::process::exit(1);
+    }
+
     // Resolved before dialing the callback listener at all: a container
     // that can't fetch/verify its own restricted worker_bundle has
     // nothing it could legitimately run, so this fails the whole process
@@ -2004,16 +2017,6 @@ async fn run_aci_callback_mode() {
 #[tokio::main]
 async fn main() {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
-
-    if bwrap_available().await {
-        log::info!("bubblewrap self-test passed at startup -- worker.py will run sandboxed");
-    } else {
-        log::error!(
-            "bubblewrap self-test (`bwrap ... -- true`) failed on this host -- \
-             refusing to start (no unsandboxed fallback, in any environment)"
-        );
-        std::process::exit(1);
-    }
 
     #[cfg(feature = "aci-attestation")]
     run_aci_callback_mode().await;
