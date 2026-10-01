@@ -111,6 +111,14 @@ jobs:
             exit 1
           fi
 
+      # Tag by branch name, not a shared floating :dev: two branches (e.g. a
+      # release dispatch and a main push) otherwise overwrite each other's
+      # tag and a consumer silently gets whichever ran last. Docker tags
+      # can't contain "/", so a branch like feature/x publishes as feature-x.
+      # Consumers pin the resulting @sha256 digest, never the tag.
+      - name: Compute branch tag
+        run: echo "BRANCH_TAG=$(printf '%s' "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9_.-' '-')" >> "$GITHUB_ENV"
+
       # `outputs:` name= accepts a comma-separated list for multiple tags in
       # one push, quoted so buildx doesn't mistake the tag-list commas for
       # the outer type=image,name=...,push=...  key separators -- confirmed
@@ -124,6 +132,6 @@ jobs:
           sbom: false
           build-args: |
             SOURCE_DATE_EPOCH=${{ env.SOURCE_DATE_EPOCH }}
-          outputs: 'type=image,"name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev,${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}",push=true,rewrite-timestamp=true'
+          outputs: 'type=image,"name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.BRANCH_TAG }},${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}",push=true,rewrite-timestamp=true'
           cache-from: type=gha
           cache-to: type=gha,mode=max

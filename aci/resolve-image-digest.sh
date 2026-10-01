@@ -23,14 +23,14 @@
 #   package defaults to aci-worker/aci-session-worker
 #           (GHCR package name, i.e. everything after ghcr.io/<org>/ --
 #           GitHub Packages allows the "/" in a container package name)
-#   tag     defaults to dev (aci-session-worker-build.yml's own
-#           convention, matching backend's lambda-executor-build.yml: a
-#           floating :dev tag alongside an immutable :<git-sha> one)
+#   tag     defaults to main (aci-session-worker-build.yml tags each image
+#           with its branch name, sanitized "/" -> "-", alongside an
+#           immutable :<git-sha> one)
 set -eu
 
 ORG="${1:-directionallyai}"
 PACKAGE="${2:-aci-worker/aci-session-worker}"
-TAG="${3:-dev}"
+TAG="${3:-main}"
 
 # GitHub's REST API path-encodes "/" in the package name as %2F -- gh api
 # does not do this for us.
