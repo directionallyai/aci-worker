@@ -3530,6 +3530,47 @@ check('process_vm_readv of A read nothing', words[1] != {MAGIC}, words)
 
     #[tokio::test]
     #[ignore = "needs syd and a worker bundle; see aci/test-syd-sandbox.sh"]
+    async fn syd_does_not_hand_session_masters_secrets_to_the_worker() {
+        // syd clears environment variables whose names look like secrets
+        // (*ACCESS*, *AUTH*, *KEY*, *TOKEN*, ... -- `syd-ls env`) from the
+        // sandboxed process's initial environment. bubblewrap passes the
+        // whole inherited environment through, so under bwrap worker code
+        // can read ACI_CALLBACK_TOKEN and the worker-runtime S3 credential.
+        // This pins the syd side of that difference. (A variable the worker
+        // legitimately needs would have to be passed with syd's `-e VAR=`;
+        // none is today -- worker.py reads its credentials from the
+        // request, and world_core.py's env reads are fallbacks.)
+        let _guard = GLOBAL_STATE.lock().await;
+        let secrets = [
+            ("ACI_CALLBACK_TOKEN", "callback-token-stand-in"),
+            ("ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY", "s3-secret-stand-in"),
+            ("ACI_WORKER_RUNTIME_ACCESS_KEY_ID", "s3-key-id-stand-in"),
+        ];
+        for (name, value) in secrets {
+            std::env::set_var(name, value);
+        }
+        let result = probe(
+            "\
+for name in ['ACI_CALLBACK_TOKEN', 'ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY', 'ACI_WORKER_RUNTIME_ACCESS_KEY_ID']:
+    check('%s not in the worker environment' % name, name not in os.environ)
+check('LD_PRELOAD cannot be smuggled in', 'LD_PRELOAD' not in os.environ)
+check('PYTHONDONTWRITEBYTECODE is set (bwrap --setenv parity)', os.environ.get('PYTHONDONTWRITEBYTECODE') == '1')
+",
+            false,
+        )
+        .await;
+        for (name, _) in secrets {
+            std::env::remove_var(name);
+        }
+        result.assert_clean(&[
+            "ACI_CALLBACK_TOKEN not in the worker environment",
+            "ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY not in the worker environment",
+            "PYTHONDONTWRITEBYTECODE is set (bwrap --setenv parity)",
+        ]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs syd and a worker bundle; see aci/test-syd-sandbox.sh"]
     async fn syd_denies_listening_raw_sockets_and_local_sockets() {
         let result = probe(
             "\

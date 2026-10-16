@@ -71,6 +71,12 @@ refusing ptrace/`process_vm_readv`. See `session_master.rs`'s "worker
 execution, via syd" comment before relying on it for concurrent tenants in
 one container.
 
+One difference in syd's favor: it clears secret-looking environment
+variables (`*TOKEN*`, `*KEY*`, `*ACCESS*`, ... -- `syd-ls env`) from the
+worker's initial environment, so worker code does not see
+`ACI_CALLBACK_TOKEN` or the worker-runtime S3 credential. Under bubblewrap
+the worker inherits `session_master`'s whole environment.
+
 ### Testing the syd backend
 
 Plain `cargo test` needs neither syd nor a bundle. The syd isolation
