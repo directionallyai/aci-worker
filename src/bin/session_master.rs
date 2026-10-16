@@ -90,9 +90,10 @@
 //!      runtime (interpreter, its own dependencies, worker.py/storage.py
 //!      themselves, all published from worker-python-runtime, a
 //!      separate, public repo) -- extracts it, and execs its own
-//!      `runtime` entry point natively inside a bubblewrap sandbox
-//!      (unprivileged user/mount/pid namespace confinement -- see that
-//!      function's own doc comment), feeding it {mode, code,
+//!      `runtime` entry point natively inside a sandbox -- bubblewrap
+//!      (unprivileged user/mount/pid namespace confinement, the default)
+//!      or syd (seccomp-unotify), per ACI_WORKER_SANDBOX; see
+//!      run_worker()'s own doc comment -- feeding it {mode, code,
 //!      storage_grant, pattern_delegate} on stdin the same shape
 //!      worker.py's own handle() already expects
 //!   10. encrypt the result (AAD "server-to-client"), write it, exit
@@ -336,6 +337,60 @@ fn worker_uid() -> u32 {
 
 fn worker_gid() -> u32 {
     env_or("WORKER_GID", "10001").parse().unwrap_or(10001)
+}
+
+/// Env var choosing which sandbox run_worker() confines worker.py with:
+/// `bwrap` (bubblewrap, the default when this is unset or empty) or `syd`
+/// (seccomp-unotify; see syd_policy()). Read fresh each time, the same
+/// discipline every other env-backed setting in this file follows. Set at
+/// launch by whatever launches the container (aci_executor.rs's own
+/// create_group_body(), attested-python-execution repo), the same way
+/// WORKER_EXECUTION_OPTIONS already is.
+///
+/// An unrecognized value is an error, not a default: a typo in a canary's
+/// launch config must not silently run the *other* backend than the one
+/// the operator thought they were measuring. Callers (startup and
+/// run_worker()) refuse to proceed on `Err`.
+const SANDBOX_BACKEND_ENV: &str = "ACI_WORKER_SANDBOX";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxBackend {
+    Bwrap,
+    Syd,
+}
+
+impl SandboxBackend {
+    /// What logs and refusal messages call this backend.
+    fn display_name(self) -> &'static str {
+        match self {
+            SandboxBackend::Bwrap => "bubblewrap",
+            SandboxBackend::Syd => "syd",
+        }
+    }
+}
+
+fn parse_sandbox_backend(raw: &str) -> Result<SandboxBackend, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "bwrap" => Ok(SandboxBackend::Bwrap),
+        "syd" => Ok(SandboxBackend::Syd),
+        _ => Err(format!(
+            "{SANDBOX_BACKEND_ENV}={raw:?} is not a known sandbox backend (expected `bwrap` or `syd`)"
+        )),
+    }
+}
+
+fn sandbox_backend() -> Result<SandboxBackend, String> {
+    parse_sandbox_backend(&env_or(SANDBOX_BACKEND_ENV, ""))
+}
+
+/// Whether this process is root -- i.e. whether it has an identity to
+/// drop. session_master is root on ACI (it has to be, to open
+/// /dev/sev-guest); an unprivileged dev/test run has nothing to drop and
+/// can't escalate anyway, so the syd backend only switches to the worker
+/// uid/gid when there is something to switch *from*.
+fn running_as_root() -> bool {
+    // SAFETY: geteuid(2) takes no arguments and cannot fail.
+    unsafe { libc::geteuid() == 0 }
 }
 
 // -- embedded SKR logic ---------------------------------------------------
@@ -759,7 +814,7 @@ pub async fn get_maa_token(
     }
 } // mod aci_attestation
 
-// -- worker execution, via bubblewrap ----------------------------------------
+// -- worker execution: sandbox backends -----------------------------------
 //
 // This image carries no Python and no baked-in worker.py/storage.py at
 // all -- every session fetches its own self-contained runtime tarball
@@ -780,6 +835,14 @@ pub async fn get_maa_token(
 // primitive (used by Flatpak sandboxing, among others) -- a real,
 // maintained project, not something hand-rolled the way sandlock's own
 // fork was.
+//
+// syd (seccomp-unotify) is a second, opt-in backend alongside it, chosen
+// per container by ACI_WORKER_SANDBOX (SANDBOX_BACKEND_ENV; bwrap stays the
+// default). Production has no seccomp filter today -- bubblewrap alone,
+// namespaces only -- and syd adds a syscall-level policy that needs
+// nothing the ACI node kernel lacks (Linux >= 5.19, no Landlock). It
+// replaces nothing yet: see the "worker execution, via syd" section below
+// for what it does and does not give up relative to bubblewrap.
 const BWRAP_BIN: &str = "bwrap";
 
 /// Fetches, verifies, and extracts a worker runtime bundle -- a tar.gz
@@ -1098,15 +1161,458 @@ async fn bwrap_available() -> bool {
     *BWRAP_AVAILABLE.get_or_init(bwrap_self_test).await
 }
 
-/// Runs the fetched worker_bundle runtime natively (its own bundled
-/// interpreter, no emulation) inside a bubblewrap sandbox -- unprivileged
-/// user/mount/pid namespaces, enforced by the kernel directly against the
-/// real process, not a RISC-V guest the way the earlier rvlinux-based
-/// sandbox worked. Feeds `request` on stdin and reads the response from
-/// stdout, exactly the same request/response shape run_worker_subprocess()
-/// (the original, unsandboxed `python3 <script>` predecessor of this
-/// function) already used -- only the execution engine changed, not the
-/// protocol.
+// -- worker execution, via syd ----------------------------------------------
+//
+// The second sandbox backend, selected with ACI_WORKER_SANDBOX=syd (see
+// SANDBOX_BACKEND_ENV; bubblewrap stays the default and its code path
+// above is untouched). syd (https://gitlab.exherbo.org/sydbox/sydbox) is
+// a seccomp-unotify sandbox: every path/exec/network syscall of the
+// worker is trapped and checked in syd's own process against a
+// deny-by-default policy (syd_policy() below) before the kernel runs it,
+// instead of bubblewrap's mount/pid namespaces. It is built from source
+// into this image (aci/Dockerfile, /usr/local/bin/syd), never fetched at
+// runtime and never vendored into worker-python-runtime.
+//
+// Why it exists: production has no seccomp filter at all today
+// (`Seccomp: 0` in ACI, and the CCE policy's seccomp_profile_sha256 is
+// empty) -- isolation is bubblewrap's namespaces only. syd adds a
+// syscall-level policy with no kernel feature requirement beyond Linux
+// >= 5.19 (ACI runs 6.1).
+//
+// What this backend deliberately does NOT use, and why:
+//
+// - No mount/pid namespaces (`unshare/mount`, `unshare/pid`). syd mounts a
+//   private procfs inside any pid namespace it creates, and that mount is
+//   fatal to syd when it fails -- and mounting a *new* procfs is exactly
+//   what a real Confidential ACI container blocks (see bwrap_self_test()'s
+//   own doc comment for the live evidence). So there is no private /tmp
+//   and no pid namespace here: /tmp is the container's own, and process
+//   isolation comes from syd hiding other processes' /proc entries and
+//   denying ptrace/signals to anything outside the sandbox, not from a
+//   namespace. This is the main thing bubblewrap still does better; see
+//   the report on DIR-386 before relying on this backend for concurrent
+//   tenants in one container.
+// - No Landlock (`sandbox/lock`): the ACI node kernel has no
+//   CONFIG_SECURITY_LANDLOCK (see the comment at the top of this section's
+//   bubblewrap predecessor above), so nothing may depend on it. Landlock
+//   is a possible extra layer on hosts that have it, not part of the
+//   policy.
+// - No syd force/fs/ioctl/mem/pid/pty/tpe/uring sandboxes (all off): path,
+//   exec and network ACLs are what bubblewrap's bind list expresses;
+//   memory/pid limits (`mem/max`, `pid/max`) exist in syd and are a
+//   follow-up, bubblewrap has neither.
+
+const SYD_BIN: &str = "syd";
+const SETPRIV_BIN: &str = "setpriv";
+
+/// Read-only system trees -- bwrap's `--ro-bind /bin /usr /lib /lib64`.
+/// syd matches *canonical* paths (symlinks resolved before the policy is
+/// consulted), so on a merged-/usr image like this one all four collapse
+/// into `/usr` (syd_policy() de-duplicates); a rule on the symlink alias
+/// itself would never match. Needed by: the dynamic loader and libc/libgcc
+/// every binary maps (CPython startup, `dash`), `/usr/share/zoneinfo`
+/// and the system CA files `/etc/ssl/certs` points into
+/// (`ssl.create_default_context()` for storage.py's S3 HTTPS), and the
+/// shell scripts' coreutils.
+const SYD_RO_TREES: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc/ssl"];
+
+/// Read-only single files -- bwrap's `--ro-bind /etc/resolv.conf` and
+/// `/etc/hosts`. Needed by: glibc's getaddrinfo() for every outbound dial
+/// storage.py and worker.py make (S3-compatible storage, /pattern/join,
+/// /pattern/msg_and_poll, the h2c callback dial).
+const SYD_RO_FILES: &[&str] = &["/etc/resolv.conf", "/etc/hosts"];
+
+/// The minimal `/dev` -- bwrap's `--dev /dev` minus the nodes CPython
+/// never opens (tty, pts, shm). Read-only: `random`/`urandom` for
+/// `os.urandom()` (AES-GCM nonces, HKDF salts in `cryptography`/tlslite).
+const SYD_DEV_RO: &[&str] = &["/dev/urandom", "/dev/random"];
+
+/// Read-write devices: `null` is what `subprocess` hands to children for
+/// DEVNULL (the reviewer `init` script's own redirections); `zero`/`full`
+/// round out bwrap's `--dev` set.
+const SYD_DEV_RW: &[&str] = &["/dev/null", "/dev/zero", "/dev/full"];
+
+/// System binaries worker.py may exec -- the *only* ones, besides the
+/// bundle's own tree and /tmp/reviewer (see SYD_POLICY_BASE). Resolved to
+/// canonical paths at policy-build time (a merged-/usr or busybox-style
+/// layout would otherwise never match), and silently skipped if absent
+/// except for the shell:
+///
+/// - `/bin/sh`: the `#!/bin/sh` shebang of the bundle's `runtime` entry
+///   point and of the reviewer bundle's `init`, and the shell
+///   `subprocess.run(..., shell=True)` uses.
+/// - `dirname`: called by `runtime` itself to find its own directory
+///   (`here="$(cd "$(dirname "$0")" && pwd)"`, worker-python-runtime).
+/// - `mkdir`, `cp`: called by the reviewer bundle's `init`
+///   (directionallyai/reviewer-agent) when
+///   `World._run_reviewer_agent()` (backend's world_core.py) runs it.
+const SYD_EXEC_ALLOWLIST: &[&str] = &["/bin/sh", "/usr/bin/dirname", "/usr/bin/mkdir", "/usr/bin/cp"];
+
+/// The static part of the syd policy: one `-m` command per entry, applied
+/// in order (the last matching rule wins). Every allowance names the
+/// footprint item that needs it -- derived by running worker.py's real
+/// request shapes under `syd -x` (trace mode) and then under enforcement
+/// until each passed with nothing extra allowed (CPython startup,
+/// `cryptography`/OpenSSL, `h2`/`hpack`/`hyperframe`, `tlslite-ng`,
+/// `tarfile`, `subprocess`, real HTTPS egress, a `queue_eval` loopback
+/// dial, an asyncio `repl` request). syd_policy() appends the parts that
+/// depend on the host's canonical paths and on the bundle directory.
+const SYD_POLICY_BASE: &[&str] = &[
+    // Every sandboxing category on, deny by default (syd's own default
+    // action is already deny; stated so the policy reads standalone).
+    "sandbox/all:on",
+    "default/all:deny",
+    // ...except the ones that are not path/exec/network ACLs and that
+    // would silently break everything if left on with no rules of their
+    // own: Landlock (`lock`) and Force (`force`, exec-checksum
+    // verification) both default to "deny every exec" with no error
+    // logged, and `fs`/`ioctl`/`mem`/`pid`/`pty`/`tpe`/`uring` are
+    // separate features this policy does not use (see the comment on this
+    // backend above). This is syd's own `off` profile minus `all`.
+    "sandbox/fs,ioctl,lock,mem,pid,pty,force,tpe,uring:off",
+    // Exec of shared objects: syd checks the exec bit on everything mapped
+    // PROT_EXEC, so libc, libgcc, the loader and every `.so` the
+    // interpreter dlopens need an exec rule (the bundle's own .so files
+    // are covered by its tree rule in syd_policy()). Needed by every
+    // dynamically linked binary below.
+    "allow/exec+/usr/lib/**/*.so*",
+    "allow/exec+/lib/**/*.so*",
+    // The fixed path world_core.py's World._run_reviewer_agent() extracts
+    // the reviewer bundle to and execs `init` from (a queued tail-call
+    // eval, run by this same sandbox). The bundle carries its own
+    // interpreter, hermes and git, so this is a whole tree, not a file --
+    // the broadest exec allowance here, and the one to revisit first.
+    "allow/exec+/tmp/reviewer/***",
+    // /tmp read-write -- bwrap's fresh tmpfs, except it is the
+    // container's own /tmp here (see the top-of-section comment). Needed
+    // by: tarfile.extractall("/tmp") of the reviewer bundle (mkdir,
+    // create, chmod, utime, symlinks), tempfile/subprocess scratch files,
+    // and the fixed /tmp/reviewer root.
+    "allow/lpath,npath,rpath,wpath,cpath,tpath,fattr,spath+/tmp/***",
+    // ...but never the extracted worker bundles themselves
+    // (fetch_worker_bundle(), root-owned, read-only in bwrap): the
+    // bundle's own tree is the interpreter the next job execs.
+    "deny/wpath,cpath,tpath,fattr,spath+/tmp/worker-runtime-*/***",
+    // Anonymous fds the `create` category also governs, matched by
+    // keyword rather than path: pipe2() (subprocess pipes, os.pipe()) and
+    // epoll_create1() (asyncio's selector loop, `repl` mode).
+    "allow/create+!pipe",
+    "allow/create+!eventpoll",
+    // fstat() on those pipes shows up to syd as a stat of
+    // /proc/self/fd/pipe:[N]; only the process's own pipes, nothing else
+    // under /proc. Without it every subprocess pipe logs a denial.
+    "allow/stat+/proc/self/fd/pipe:\\[*\\]",
+    // Network. `sandbox/net` is on via `sandbox/all`.
+    //
+    // socketpair() is reported as an unnamed UNIX bind: asyncio's
+    // self-pipe (every `repl` request, via asyncio.run()). Not a listener.
+    "allow/net/bind+!unnamed",
+    // Loopback connects: worker.py's make_queue_eval() dials the
+    // 127.0.0.1:<ephemeral> listener spawn_queue_listener() opens in this
+    // process. Listed on its own, ahead of the general rule below, so a
+    // future egress allowlist that drops `any` keeps it.
+    "allow/net/connect+loopback!0-65535",
+    // Outbound TCP/UDP to anywhere: storage.py's HTTPS to the
+    // S3-compatible store, /pattern/join and /pattern/msg_and_poll, the
+    // h2c callback dial, and DNS (UDP 53, plus the UDP connect() glibc's
+    // getaddrinfo() does for address selection). The same unrestricted
+    // egress bwrap's `--share-net` gives; per-host egress rules are a
+    // follow-up, not part of this swap. Deliberately NOT allowed: bind,
+    // listen, accept (no inbound), raw/packet/netlink sockets, and UNIX
+    // sockets other than the anonymous pair above.
+    "allow/net/connect+any!0-65535",
+];
+
+/// True if `path` could be mis-parsed as a pattern by syd (glob
+/// metacharacters, or the `:`/`!` separators of its argument syntax).
+fn has_syd_metacharacters(path: &str) -> bool {
+    path.chars().any(|c| matches!(c, '*' | '?' | '[' | ']' | '\\' | ':' | '!'))
+}
+
+/// Canonicalizes `path` for use in a syd rule, refusing anything syd
+/// would read as a pattern rather than a literal path.
+fn syd_canonical(path: &std::path::Path) -> Result<String, String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|e| format!("could not resolve {} for the syd policy: {e}", path.display()))?;
+    let canonical = canonical
+        .to_str()
+        .ok_or_else(|| format!("{} is not valid UTF-8", canonical.display()))?
+        .to_string();
+    if has_syd_metacharacters(&canonical) {
+        return Err(format!("{canonical} contains characters syd would read as a pattern"));
+    }
+    Ok(canonical)
+}
+
+/// `walk`+`stat` (path traversal and existence, nothing readable) for each
+/// ancestor directory of `canonical`, outermost first, skipping ones
+/// already granted. syd denies a path whose *parent* it hasn't been told
+/// may be traversed (and then reports ENOENT), so every allowed path needs
+/// its ancestors spelled out -- without that, `/etc/hosts` is unreachable
+/// even with a read rule on it.
+fn push_syd_ancestors(rules: &mut Vec<String>, granted: &mut std::collections::BTreeSet<String>, canonical: &str) {
+    let mut ancestors: Vec<&std::path::Path> = std::path::Path::new(canonical)
+        .ancestors()
+        .skip(1)
+        .collect();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        let Some(ancestor) = ancestor.to_str() else { continue };
+        if granted.insert(ancestor.to_string()) {
+            rules.push(format!("allow/walk,stat+{ancestor}"));
+        }
+    }
+}
+
+/// If `original` is a symlink (or sits behind one), syd walks the *alias*
+/// path -- every lexical prefix of it, so `/bin` and then `/bin/sh` when
+/// resolving `/bin/sh` -- before it ever sees the canonical one, and denies
+/// the whole lookup (as ENOENT) unless those are traversable too. So grant
+/// `walk`/`stat`/`readlink` on the alias (and, for a directory alias,
+/// everything lexically under it: traversal only, never read -- contents
+/// are read through their canonical paths, which are granted separately)
+/// and on its own ancestors. A no-op when the path is already canonical.
+fn push_syd_alias(
+    rules: &mut Vec<String>,
+    granted: &mut std::collections::BTreeSet<String>,
+    original: &str,
+    canonical: &str,
+    is_dir: bool,
+) {
+    if original == canonical {
+        return;
+    }
+    push_syd_ancestors(rules, granted, original);
+    if granted.insert(original.to_string()) {
+        let pattern = if is_dir { format!("{original}/***") } else { original.to_string() };
+        rules.push(format!("allow/walk,stat,readlink+{pattern}"));
+    }
+}
+
+/// The full list of `-m` commands for one syd invocation: SYD_POLICY_BASE
+/// plus the host-canonical read-only trees/files/devices, the exec
+/// allowlist, and -- once a bundle exists -- the bundle's own tree
+/// (`None` for startup's self-test, which runs before the bundle is
+/// extracted). Everything derived from a path is canonicalized and
+/// checked for pattern metacharacters first; a path that can't be
+/// resolved is an error for the shell and the bundle, and simply skipped
+/// for the rest of the optional system paths (e.g. `/lib64` on a
+/// non-x86 image, `cp` in a stripped-down one).
+fn syd_policy(bundle: Option<&std::path::Path>) -> Result<Vec<String>, String> {
+    let mut rules: Vec<String> = SYD_POLICY_BASE.iter().map(|s| s.to_string()).collect();
+    let mut granted = std::collections::BTreeSet::new();
+    let mut trees: Vec<String> = Vec::new();
+
+    for (original, tree) in SYD_RO_TREES
+        .iter()
+        .filter_map(|t| Some((*t, syd_canonical(std::path::Path::new(t)).ok()?)))
+    {
+        push_syd_alias(&mut rules, &mut granted, original, &tree, true);
+        if trees.iter().any(|t| std::path::Path::new(&tree).starts_with(t)) {
+            continue;
+        }
+        push_syd_ancestors(&mut rules, &mut granted, &tree);
+        // lpath/npath/rpath: traverse, list, stat and read -- never write.
+        rules.push(format!("allow/lpath,npath,rpath+{tree}/***"));
+        trees.push(tree);
+    }
+
+    if let Some(bundle) = bundle {
+        // The extracted worker bundle: read-only, and the one tree
+        // besides /tmp/reviewer that may be exec'd -- its interpreter, its
+        // `runtime` entry point, and the C-extension .so files it dlopens
+        // (cryptography's _rust.abi3.so, _cffi_backend, lib-dynload).
+        let tree = syd_canonical(bundle)?;
+        push_syd_ancestors(&mut rules, &mut granted, &tree);
+        rules.push(format!("allow/lpath,npath,rpath+{tree}/***"));
+        rules.push(format!("allow/exec+{tree}/***"));
+    }
+
+    for (paths, mode) in [
+        (SYD_RO_FILES, "lpath,npath,rpath"),
+        (SYD_DEV_RO, "lpath,npath,rpath"),
+        (SYD_DEV_RW, "lpath,npath,rpath,wpath"),
+    ] {
+        for path in paths {
+            let Ok(file) = syd_canonical(std::path::Path::new(path)) else { continue };
+            push_syd_alias(&mut rules, &mut granted, path, &file, false);
+            push_syd_ancestors(&mut rules, &mut granted, &file);
+            rules.push(format!("allow/{mode}+{file}"));
+        }
+    }
+    // /tmp's own ancestors (just `/`); its tree rule is in SYD_POLICY_BASE.
+    push_syd_ancestors(&mut rules, &mut granted, "/tmp");
+
+    for name in SYD_EXEC_ALLOWLIST {
+        match syd_canonical(std::path::Path::new(name)) {
+            Ok(binary) => rules.push(format!("allow/exec+{binary}")),
+            Err(e) if *name == "/bin/sh" => return Err(format!("the system shell is required: {e}")),
+            Err(_) => {}
+        }
+    }
+    #[cfg(test)]
+    rules.extend(syd_test_extra_rules());
+    Ok(rules)
+}
+
+/// Test builds only (compiled out of the real binary): extra syd commands,
+/// newline-separated, from ACI_TEST_SYD_EXTRA_RULES. Exists so
+/// syd_isolation_tests can run on a developer host whose layout differs
+/// from the image's (non-GNU coreutils reading /proc/self/auxv, say)
+/// without widening the policy the image ships; the image test run sets
+/// nothing.
+#[cfg(test)]
+fn syd_test_extra_rules() -> Vec<String> {
+    std::env::var("ACI_TEST_SYD_EXTRA_RULES")
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The command line for one syd-confined process: the same two-layer
+/// shape as the bubblewrap path (the standalone `timeout` wrapper --
+/// `-s 9` SIGKILLs the whole process group it creates, `-k 5` follows up
+/// as insurance -- around the sandbox, whose child dies with it: syd sets
+/// PR_SET_PDEATHSIG(SIGKILL) on the sandboxed process, so killing syd
+/// takes the worker with it, the way `--die-with-parent` does for bwrap),
+/// with an optional privilege drop in between.
+///
+/// `drop_privileges`: becomes the unprivileged worker uid/gid (WORKER_UID/
+/// WORKER_GID) *before* syd starts, via `setpriv --clear-groups`, so
+/// neither syd nor the worker ever holds root. (bwrap's `--uid` maps down
+/// inside its own user namespace instead; there is no namespace here to
+/// map in.) Needs CAP_SETUID/CAP_SETGID, which session_master as root in
+/// ACI is assumed to hold -- an assumption syd_self_test() exercises with
+/// this exact invocation, so a container without them refuses to start
+/// rather than running the worker as root. Only true when this process is
+/// root (running_as_root()); `setpriv --clear-groups` fails otherwise.
+///
+/// `PYTHONDONTWRITEBYTECODE=1` is bwrap's `--setenv`. Beyond syd stripping
+/// its own list of unsafe variables (LD_*, etc.), the environment is
+/// inherited as-is, exactly as with bwrap.
+fn syd_command(
+    timeout_secs: u64,
+    rules: &[String],
+    drop_privileges: bool,
+    program: &str,
+    args: &[&str],
+) -> Command {
+    let mut c = Command::new("timeout");
+    c.arg("-s").arg("9").arg("-k").arg("5").arg(timeout_secs.to_string());
+    if drop_privileges {
+        c.arg(SETPRIV_BIN)
+            .arg(format!("--reuid={}", worker_uid()))
+            .arg(format!("--regid={}", worker_gid()))
+            .arg("--clear-groups");
+    }
+    c.arg(SYD_BIN);
+    for rule in rules {
+        c.arg("-m").arg(rule);
+    }
+    c.arg("-e").arg("PYTHONDONTWRITEBYTECODE=1");
+    c.arg("--").arg(program).args(args);
+    c
+}
+
+/// What syd_self_test() runs inside the sandbox. The shell itself running
+/// at all proves the exec allowlist works; then `true` -- present on any
+/// image, deliberately not on SYD_EXEC_ALLOWLIST -- must be refused. A
+/// policy that silently stopped being enforced would let it run and exit
+/// 3, instead of the whole self-test passing on "syd started".
+const SYD_SELF_TEST_SCRIPT: &str = "if /usr/bin/true; then exit 3; fi; exit 0";
+
+/// Like bwrap_self_test(): a real, live check against this host, not
+/// just "is the binary present" -- and against the *same* invocation
+/// run_worker() uses (privilege drop, full policy, timeout wrapper), so
+/// anything the host can't do (a missing `syd`/`setpriv`, no seccomp
+/// user notification, no CAP_SETUID) fails here, at startup, instead of
+/// per request. Cached via syd_available().
+///
+/// Ends with the deny check described on SYD_SELF_TEST_SCRIPT. syd's own
+/// stderr (JSON log lines, including each denied access) is logged on
+/// failure, truncated, since "exit 13" alone says nothing about which
+/// rule was missing.
+async fn syd_self_test() -> bool {
+    let rules = match syd_policy(None) {
+        Ok(rules) => rules,
+        Err(e) => {
+            log::error!("syd self-test could not build its policy ({e})");
+            return false;
+        }
+    };
+    let mut command = syd_command(10, &rules, running_as_root(), "/bin/sh", &["-c", SYD_SELF_TEST_SCRIPT]);
+    match command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => true,
+        Ok(output) => {
+            log::error!(
+                "syd self-test (`syd ... -- /bin/sh -c <deny check>`) exited {}: {}",
+                output.status,
+                truncate_for_log(&String::from_utf8_lossy(&output.stderr))
+            );
+            false
+        }
+        Err(e) => {
+            log::error!("syd self-test could not even spawn ({e})");
+            false
+        }
+    }
+}
+
+static SYD_AVAILABLE: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+
+/// Cached result of syd_self_test(), checked once (at startup, via
+/// run_aci_callback_mode(), or lazily on first use) for the same reason
+/// bwrap_available() is. No fallback of any kind when this is false:
+/// not to bubblewrap, not to running unsandboxed -- the caller refuses.
+async fn syd_available() -> bool {
+    *SYD_AVAILABLE.get_or_init(syd_self_test).await
+}
+
+/// Whichever backend `backend` names, cached self-test result.
+async fn sandbox_available(backend: SandboxBackend) -> bool {
+    match backend {
+        SandboxBackend::Bwrap => bwrap_available().await,
+        SandboxBackend::Syd => syd_available().await,
+    }
+}
+
+/// Pure comparison, split out of run_worker() purely so it's unit-testable
+/// without needing WORKER_RUNTIME's own OnceCell populated (that requires a
+/// real startup fetch) -- see run_worker()'s own comment for what this
+/// enforces and why. `Ok(())` covers both a matching hash and no
+/// `worker_bundle` field at all in the request.
+fn check_requested_worker_bundle_matches_pinned(
+    request: &serde_json::Value,
+    pinned_sha256_hex: &str,
+) -> Result<(), String> {
+    let Some(requested) = request
+        .get("worker_bundle")
+        .and_then(|v| v.get("sha256"))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(());
+    };
+    if requested.to_ascii_lowercase() != pinned_sha256_hex {
+        return Err(format!(
+            "request named worker_bundle {requested:?}, but this container is restricted to {pinned_sha256_hex:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// The bubblewrap backend's whole invocation, moved out of run_worker()
+/// unchanged when the syd backend arrived: `timeout` around `bwrap`, with the
+/// read-only binds, fresh `/tmp`, and uid/gid mapping run_worker() has always
+/// used. `bundle` is the extracted worker bundle directory, `entry_point` its
+/// `runtime` script.
 ///
 /// Readable paths are the minimum this repo has confirmed the bundled
 /// interpreter/TLS stack actually need: `/usr` and `/lib` (the musl
@@ -1172,10 +1678,6 @@ async fn bwrap_available() -> bool {
 /// the sandbox's own namespace is the bubblewrap-idiomatic way to achieve
 /// the same "worker code never runs as root" property.
 ///
-/// Falls back to running worker.py unsandboxed on a host that fails
-/// bwrap_available()'s own self-test -- see that function's own doc
-/// comment for why.
-///
 /// A non-zero exit, a timeout, or a response that doesn't parse as JSON
 /// all come back as an ordinary `{"ok": false, "error": ...}` value --
 /// the caller always gets a JSON value back, never an exception to
@@ -1197,30 +1699,59 @@ async fn bwrap_available() -> bool {
 /// nested dev environment, not ACI's own narrower procfs-specific
 /// restriction described above.) Built against bubblewrap's own real,
 /// verified `--help` output, not guessed.
-/// Pure comparison, split out of run_worker() purely so it's unit-testable
-/// without needing WORKER_RUNTIME's own OnceCell populated (that requires a
-/// real startup fetch) -- see run_worker()'s own comment for what this
-/// enforces and why. `Ok(())` covers both a matching hash and no
-/// `worker_bundle` field at all in the request.
-fn check_requested_worker_bundle_matches_pinned(
-    request: &serde_json::Value,
-    pinned_sha256_hex: &str,
-) -> Result<(), String> {
-    let Some(requested) = request
-        .get("worker_bundle")
-        .and_then(|v| v.get("sha256"))
-        .and_then(|v| v.as_str())
-    else {
-        return Ok(());
-    };
-    if requested.to_ascii_lowercase() != pinned_sha256_hex {
-        return Err(format!(
-            "request named worker_bundle {requested:?}, but this container is restricted to {pinned_sha256_hex:?}"
-        ));
-    }
-    Ok(())
+fn bwrap_worker_command(timeout: Duration, bundle: &str, entry_point: &str) -> Command {
+    let mut c = Command::new("timeout");
+    c.arg("-s").arg("9")
+        .arg("-k").arg("5")
+        .arg(timeout.as_secs().to_string())
+        .arg(BWRAP_BIN)
+        .arg("--unshare-all").arg("--share-net")
+        .arg("--die-with-parent")
+        .arg("--new-session")
+        .arg("--dev").arg("/dev")
+        .arg("--ro-bind").arg("/bin").arg("/bin")
+        .arg("--ro-bind").arg("/usr").arg("/usr")
+        .arg("--ro-bind").arg("/lib").arg("/lib")
+        .arg("--ro-bind").arg("/lib64").arg("/lib64")
+        .arg("--ro-bind").arg("/etc/ssl").arg("/etc/ssl")
+        .arg("--ro-bind").arg("/etc/resolv.conf").arg("/etc/resolv.conf")
+        .arg("--ro-bind").arg("/etc/hosts").arg("/etc/hosts")
+        .arg("--tmpfs").arg("/tmp")
+        .arg("--chmod").arg("1777").arg("/tmp")
+        .arg("--setenv").arg("PYTHONDONTWRITEBYTECODE").arg("1")
+        .arg("--uid").arg(worker_uid().to_string())
+        .arg("--gid").arg(worker_gid().to_string())
+        // The --ro-bind for the bundle dir must come after --tmpfs
+        // /tmp above, not before -- bwrap applies mount actions in
+        // argument order, and a bind targeting a path under /tmp
+        // issued before the fresh tmpfs is mounted there would just
+        // be shadowed by it.
+        .arg("--ro-bind").arg(bundle).arg(bundle)
+        .arg("--")
+        .arg(entry_point);
+    c
 }
 
+/// Runs the fetched worker_bundle runtime natively (its own bundled
+/// interpreter, no emulation) inside the sandbox backend
+/// ACI_WORKER_SANDBOX selects (sandbox_backend()): bubblewrap -- the
+/// default -- or syd. Feeds `request` on stdin and reads the response from
+/// stdout, exactly the same request/response shape run_worker_subprocess()
+/// (the original, unsandboxed `python3 <script>` predecessor of this
+/// function) already used -- only the execution engine changed, not the
+/// protocol.
+///
+/// Either backend is enforced by the kernel directly against the real
+/// process, not a RISC-V guest the way the earlier rvlinux-based sandbox
+/// worked. There is no sandboxless fallback and no fallback from one
+/// backend to the other, in any environment: if the selected backend's
+/// self-test fails (sandbox_available()), or ACI_WORKER_SANDBOX names
+/// neither, the request is refused with an error naming the backend.
+///
+/// The `syd` backend's policy, and what it can't do that bubblewrap can,
+/// are documented at syd_policy() and the "worker execution, via syd"
+/// section comment above it; the bubblewrap backend's invocation, at
+/// bwrap_worker_command().
 async fn run_worker(request: &serde_json::Value, timeout: Duration) -> serde_json::Value {
     let payload = match serde_json::to_vec(request) {
         Ok(p) => p,
@@ -1280,46 +1811,32 @@ async fn run_worker(request: &serde_json::Value, timeout: Duration) -> serde_jso
     // interpreter's default sys.path.
     let bundle = worker_bundle_path.to_string_lossy().into_owned();
     let entry_point = worker_bundle_path.join("runtime").to_string_lossy().into_owned();
-    let sandboxed = bwrap_available().await;
-    // No sandboxless fallback, in any environment (dev included): the
-    // sandbox is the worker's isolation boundary, so a host that can't
-    // provide it fails loudly instead of silently running unconfined.
-    if !sandboxed {
-        return worker_failure(
-            "bubblewrap sandbox is unavailable on this host -- refusing to run the worker unsandboxed",
-        );
+    let backend = match sandbox_backend() {
+        Ok(backend) => backend,
+        Err(e) => {
+            return worker_failure(&format!("{e} -- refusing to run the worker unsandboxed"));
+        }
+    };
+    // No sandboxless fallback, in any environment (dev included), and no
+    // fallback from one backend to the other: the sandbox is the worker's
+    // isolation boundary, so a host that can't provide the *selected* one
+    // fails loudly instead of silently running unconfined or under a
+    // different sandbox than the operator asked for.
+    if !sandbox_available(backend).await {
+        return worker_failure(&format!(
+            "{} sandbox is unavailable on this host -- refusing to run the worker unsandboxed",
+            backend.display_name()
+        ));
     }
-    let mut command = {
-        let mut c = Command::new("timeout");
-        c.arg("-s").arg("9")
-            .arg("-k").arg("5")
-            .arg(timeout.as_secs().to_string())
-            .arg(BWRAP_BIN)
-            .arg("--unshare-all").arg("--share-net")
-            .arg("--die-with-parent")
-            .arg("--new-session")
-            .arg("--dev").arg("/dev")
-            .arg("--ro-bind").arg("/bin").arg("/bin")
-            .arg("--ro-bind").arg("/usr").arg("/usr")
-            .arg("--ro-bind").arg("/lib").arg("/lib")
-            .arg("--ro-bind").arg("/lib64").arg("/lib64")
-            .arg("--ro-bind").arg("/etc/ssl").arg("/etc/ssl")
-            .arg("--ro-bind").arg("/etc/resolv.conf").arg("/etc/resolv.conf")
-            .arg("--ro-bind").arg("/etc/hosts").arg("/etc/hosts")
-            .arg("--tmpfs").arg("/tmp")
-            .arg("--chmod").arg("1777").arg("/tmp")
-            .arg("--setenv").arg("PYTHONDONTWRITEBYTECODE").arg("1")
-            .arg("--uid").arg(worker_uid().to_string())
-            .arg("--gid").arg(worker_gid().to_string())
-            // The --ro-bind for the bundle dir must come after --tmpfs
-            // /tmp above, not before -- bwrap applies mount actions in
-            // argument order, and a bind targeting a path under /tmp
-            // issued before the fresh tmpfs is mounted there would just
-            // be shadowed by it.
-            .arg("--ro-bind").arg(&bundle).arg(&bundle)
-            .arg("--")
-            .arg(&entry_point);
-        c
+    let mut command = match backend {
+        SandboxBackend::Bwrap => bwrap_worker_command(timeout, &bundle, &entry_point),
+        SandboxBackend::Syd => {
+            let rules = match syd_policy(Some(&worker_bundle_path)) {
+                Ok(rules) => rules,
+                Err(e) => return worker_failure(&format!("could not build the syd policy: {e}")),
+            };
+            syd_command(timeout.as_secs(), &rules, running_as_root(), &entry_point, &[])
+        }
     };
     let mut child = match command
         .kill_on_drop(true)
@@ -1984,14 +2501,39 @@ async fn run_aci_callback_mode() {
     // Checked right after the build-variant line above (which CI greps
     // for) so a host without a working sandbox still identifies its build,
     // then fails loudly rather than running unconfined.
-    if bwrap_available().await {
-        log::info!("bubblewrap self-test passed at startup -- worker.py will run sandboxed");
-    } else {
-        log::error!(
-            "bubblewrap self-test (`bwrap ... -- true`) failed on this host -- \
-             refusing to start (no unsandboxed fallback, in any environment)"
-        );
-        std::process::exit(1);
+    let backend = match sandbox_backend() {
+        Ok(backend) => backend,
+        Err(e) => {
+            log::error!("{e} -- refusing to start (no default is guessed for an unknown backend)");
+            std::process::exit(1);
+        }
+    };
+    log::info!("sandbox backend: {} ({SANDBOX_BACKEND_ENV})", backend.display_name());
+    match backend {
+        SandboxBackend::Bwrap => {
+            if bwrap_available().await {
+                log::info!("bubblewrap self-test passed at startup -- worker.py will run sandboxed");
+            } else {
+                log::error!(
+                    "bubblewrap self-test (`bwrap ... -- true`) failed on this host -- \
+                     refusing to start (no unsandboxed fallback, in any environment)"
+                );
+                std::process::exit(1);
+            }
+        }
+        SandboxBackend::Syd => {
+            if syd_available().await {
+                log::info!(
+                    "syd self-test passed at startup (backend=syd) -- worker.py will run sandboxed"
+                );
+            } else {
+                log::error!(
+                    "syd self-test failed on this host (backend=syd) -- refusing to start \
+                     (no fallback to bubblewrap and no unsandboxed fallback, in any environment)"
+                );
+                std::process::exit(1);
+            }
+        }
     }
 
     // Resolved before dialing the callback listener at all: a container
@@ -2151,5 +2693,1002 @@ mod worker_bundle_tests {
         let pinned = "a".repeat(64);
         let request = serde_json::json!({});
         assert!(check_requested_worker_bundle_matches_pinned(&request, &pinned).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod sandbox_backend_tests {
+    // Covers the backend switch and the syd policy builder -- everything
+    // that needs neither syd nor a worker bundle on the host, so plain
+    // `cargo test` stays green anywhere. The tests that actually run
+    // worker.py under syd are in syd_isolation_tests below (#[ignore]).
+    use super::*;
+
+    /// Tests that read or write process-global state (environment
+    /// variables, WORKER_RUNTIME's OnceCell) hold this for their whole
+    /// duration -- `cargo test` runs tests on parallel threads of one
+    /// process.
+    pub(super) static GLOBAL_STATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A scratch directory that looks like an extracted worker bundle
+    /// (`<dir>/runtime` exists), named like fetch_worker_bundle()'s own so
+    /// the policy's /tmp/worker-runtime-*/ rule applies to it.
+    pub(super) struct FakeBundle(pub(super) std::path::PathBuf);
+
+    impl FakeBundle {
+        pub(super) fn new(tag: &str) -> Self {
+            let dir = std::path::PathBuf::from(format!(
+                "/tmp/worker-runtime-test-{tag}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("runtime"), "#!/bin/sh\nexit 0\n").unwrap();
+            FakeBundle(dir)
+        }
+    }
+
+    impl Drop for FakeBundle {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn backend_defaults_to_bwrap_when_unset_or_empty() {
+        assert_eq!(parse_sandbox_backend(""), Ok(SandboxBackend::Bwrap));
+        assert_eq!(parse_sandbox_backend("  "), Ok(SandboxBackend::Bwrap));
+    }
+
+    #[test]
+    fn backend_recognizes_both_names_case_insensitively() {
+        assert_eq!(parse_sandbox_backend("bwrap"), Ok(SandboxBackend::Bwrap));
+        assert_eq!(parse_sandbox_backend("syd"), Ok(SandboxBackend::Syd));
+        assert_eq!(parse_sandbox_backend(" SYD "), Ok(SandboxBackend::Syd));
+    }
+
+    #[test]
+    fn an_unknown_backend_is_an_error_never_a_default() {
+        for raw in ["bubblewrap", "none", "off", "sydd", "0"] {
+            let err = parse_sandbox_backend(raw).unwrap_err();
+            assert!(err.contains(SANDBOX_BACKEND_ENV) && err.contains(raw), "{err}");
+        }
+    }
+
+    #[test]
+    fn syd_policy_is_deny_by_default_and_has_no_bundle_rules_without_a_bundle() {
+        let rules = syd_policy(None).unwrap();
+        assert!(rules.iter().any(|r| r == "sandbox/all:on"));
+        assert!(rules.iter().any(|r| r == "default/all:deny"));
+        assert!(
+            !rules.iter().any(|r| r.contains("/tmp/worker-runtime-") && r.starts_with("allow/")),
+            "{rules:?}"
+        );
+        // The shell is the one binary the policy cannot work without.
+        let sh = std::fs::canonicalize("/bin/sh").unwrap();
+        assert!(rules.contains(&format!("allow/exec+{}", sh.display())), "{rules:?}");
+    }
+
+    #[test]
+    fn syd_policy_never_allows_listening_or_the_sev_device() {
+        let bundle = FakeBundle::new("policy-listen");
+        let rules = syd_policy(Some(&bundle.0)).unwrap().join("\n");
+        assert!(!rules.contains("sev-guest"), "{rules}");
+        assert!(!rules.contains("allow/net/accept"), "{rules}");
+        // The only bind allowance is socketpair()'s anonymous UNIX pair.
+        let binds: Vec<_> = rules.lines().filter(|l| l.contains("net/bind")).collect();
+        assert_eq!(binds, ["allow/net/bind+!unnamed"], "{rules}");
+        // Nothing under /proc is allowed beyond the process's own pipes.
+        for line in rules.lines().filter(|l| l.starts_with("allow/") && l.contains("/proc")) {
+            assert!(line.contains("/proc/self/fd/pipe:"), "{line}");
+        }
+    }
+
+    #[test]
+    fn syd_policy_makes_the_bundle_readable_and_executable_but_not_writable() {
+        let bundle = FakeBundle::new("policy-bundle");
+        let canonical = std::fs::canonicalize(&bundle.0).unwrap();
+        let canonical = canonical.display();
+        let rules = syd_policy(Some(&bundle.0)).unwrap();
+        assert!(rules.contains(&format!("allow/lpath,npath,rpath+{canonical}/***")), "{rules:?}");
+        assert!(rules.contains(&format!("allow/exec+{canonical}/***")), "{rules:?}");
+        // No allow rule for the bundle grants any write category...
+        for rule in rules.iter().filter(|r| r.contains(&*canonical.to_string())) {
+            assert!(rule.starts_with("allow/lpath,npath,rpath+") || rule.starts_with("allow/exec+") || rule.starts_with("allow/walk,stat+"), "{rule}");
+        }
+        // ...and the static deny for extracted bundles comes after the /tmp
+        // read-write allowance it carves out of (last matching rule wins).
+        let allow_tmp = rules.iter().position(|r| r.ends_with("+/tmp/***") && r.contains("wpath")).unwrap();
+        let deny_bundles = rules
+            .iter()
+            .position(|r| r == "deny/wpath,cpath,tpath,fattr,spath+/tmp/worker-runtime-*/***")
+            .unwrap();
+        assert!(deny_bundles > allow_tmp);
+    }
+
+    #[test]
+    fn syd_policy_collapses_aliases_to_canonical_paths_and_grants_ancestors() {
+        let rules = syd_policy(None).unwrap();
+        // /bin, /lib and /lib64 are symlinks into /usr on a merged-/usr
+        // image. Reads are matched on canonical paths, so no read rule may
+        // be emitted for the alias's contents -- but the alias itself must
+        // be traversable, or resolving /bin/sh fails with ENOENT.
+        for alias in ["/bin", "/lib", "/lib64"] {
+            let canonical = std::fs::canonicalize(alias);
+            if matches!(&canonical, Ok(c) if c != std::path::Path::new(alias)) {
+                assert!(
+                    !rules.iter().any(|r| r.starts_with("allow/lpath,npath,rpath") && r.ends_with(&format!("+{alias}/***"))),
+                    "{alias}: {rules:?}"
+                );
+                assert!(
+                    rules.iter().any(|r| r == &format!("allow/walk,stat,readlink+{alias}/***")),
+                    "{alias}: {rules:?}"
+                );
+            }
+        }
+        // Every allowed file's directory chain is traversable.
+        assert!(rules.iter().any(|r| r == "allow/walk,stat+/"), "{rules:?}");
+        assert!(rules.iter().any(|r| r == "allow/walk,stat+/dev"), "{rules:?}");
+    }
+
+    #[test]
+    fn syd_policy_rejects_a_bundle_path_syd_would_read_as_a_pattern() {
+        let dir = std::path::PathBuf::from(format!("/tmp/aci-syd-meta-[x]-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = syd_policy(Some(&dir)).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(err.contains("pattern"), "{err}");
+    }
+
+    #[test]
+    fn syd_command_is_timeout_around_privilege_drop_around_syd() {
+        let rules = vec!["sandbox/all:on".to_string()];
+        let args_of = |drop: bool| -> Vec<String> {
+            let c = syd_command(7, &rules, drop, "/entry", &["a"]);
+            let std = c.as_std();
+            assert_eq!(std.get_program(), "timeout");
+            std.get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+        };
+        let reuid = format!("--reuid={}", worker_uid());
+        let regid = format!("--regid={}", worker_gid());
+        let dropped = args_of(true);
+        assert_eq!(
+            dropped[..9],
+            ["-s", "9", "-k", "5", "7", "setpriv", reuid.as_str(), regid.as_str(), "--clear-groups"]
+        );
+        assert_eq!(dropped[9..], ["syd", "-m", "sandbox/all:on", "-e", "PYTHONDONTWRITEBYTECODE=1", "--", "/entry", "a"]);
+        let kept = args_of(false);
+        assert_eq!(kept[..6], ["-s", "9", "-k", "5", "7", "syd"]);
+    }
+
+    #[test]
+    fn bwrap_invocation_is_exactly_what_it_was_before_the_syd_backend() {
+        // The default backend's argv, pinned: the syd backend must not
+        // have touched it (it was moved out of run_worker() unchanged).
+        let command = bwrap_worker_command(Duration::from_secs(300), "/tmp/b/runtime", "/tmp/b/runtime/runtime");
+        let std = command.as_std();
+        assert_eq!(std.get_program(), "timeout");
+        let args: Vec<String> = std.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let uid = worker_uid().to_string();
+        let gid = worker_gid().to_string();
+        let expected = [
+            "-s", "9", "-k", "5", "300", "bwrap", "--unshare-all", "--share-net", "--die-with-parent",
+            "--new-session", "--dev", "/dev", "--ro-bind", "/bin", "/bin", "--ro-bind", "/usr", "/usr",
+            "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--ro-bind", "/etc/ssl",
+            "/etc/ssl", "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf", "--ro-bind", "/etc/hosts",
+            "/etc/hosts", "--tmpfs", "/tmp", "--chmod", "1777", "/tmp", "--setenv",
+            "PYTHONDONTWRITEBYTECODE", "1", "--uid", uid.as_str(), "--gid", gid.as_str(), "--ro-bind",
+            "/tmp/b/runtime", "/tmp/b/runtime", "--", "/tmp/b/runtime/runtime",
+        ];
+        assert_eq!(args, expected);
+    }
+
+    #[tokio::test]
+    async fn run_worker_refuses_an_unknown_backend_instead_of_guessing() {
+        let _guard = GLOBAL_STATE.lock().await;
+        let bundle = FakeBundle::new("unknown-backend");
+        let _ = WORKER_RUNTIME.set(Ok(PinnedWorkerRuntime {
+            path: bundle.0.clone(),
+            sha256_hex: "0".repeat(64),
+        }));
+        let previous = std::env::var_os(SANDBOX_BACKEND_ENV);
+        std::env::set_var(SANDBOX_BACKEND_ENV, "sydd");
+        let response = run_worker(&serde_json::json!({"mode": "eval", "code": "1"}), Duration::from_secs(5)).await;
+        match previous {
+            Some(v) => std::env::set_var(SANDBOX_BACKEND_ENV, v),
+            None => std::env::remove_var(SANDBOX_BACKEND_ENV),
+        }
+        let error = response["error"].as_str().unwrap_or_default();
+        assert_eq!(response["ok"], false, "{response}");
+        assert!(error.contains("not a known sandbox backend"), "{response}");
+        assert!(error.contains("refusing to run the worker unsandboxed"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn syd_self_test_fails_closed_when_syd_is_not_installed() {
+        let _guard = GLOBAL_STATE.lock().await;
+        // A PATH holding only `timeout`: the wrapper runs, `syd` can't be
+        // found, and the self-test must say no -- never panic, never pass.
+        let dir = std::path::PathBuf::from(format!("/tmp/aci-syd-nopath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let timeout_bin = ["/usr/bin/timeout", "/bin/timeout"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("timeout(1) is required to run these tests");
+        let _ = std::os::unix::fs::symlink(timeout_bin, dir.join("timeout"));
+        let previous = std::env::var_os("PATH");
+        std::env::set_var("PATH", &dir);
+        let passed = syd_self_test().await;
+        match previous {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!passed);
+    }
+}
+
+#[cfg(test)]
+mod syd_isolation_tests {
+    // Isolation regression tests for the syd backend: each runs a probe
+    // *inside* a real worker.py (`world: false`, `repl` mode, so no storage
+    // grant is needed) under the real policy, and asserts on what the
+    // sandboxed code could and could not do.
+    //
+    // All #[ignore]d -- they need `syd` on PATH and an extracted
+    // worker-python-runtime bundle (ACI_TEST_BUNDLE_DIR, the directory that
+    // contains the `runtime` entry point), neither of which a plain
+    // `cargo test` host has. aci/test-syd-sandbox.sh builds both into a
+    // Docker image and runs exactly:
+    //
+    //     cargo test --release --features aci-attestation -- --ignored --test-threads=1 syd_
+    //
+    // as root (the image's session_master runs as root, and one test checks
+    // the privilege drop). Most probes run with `drop_privileges = false`
+    // on purpose: the worker then has the *same identity* as this test
+    // process, so what they show is syd's policy alone, not Unix
+    // permissions doing the work. The privilege drop is tested separately.
+    //
+    // ACI_TEST_SYD_EXTRA_RULES (see syd_test_extra_rules()) exists only to
+    // let a developer run these on a host whose layout differs from the
+    // image's; the image run sets nothing.
+    use super::sandbox_backend_tests::GLOBAL_STATE;
+    use super::*;
+
+    /// Whether the *kernel* confines signals itself (Landlock ABI >= 6,
+    /// "scoped signals", Linux 6.12+). syd only falls back to its own
+    /// seccomp filter for signals when it isn't -- and that filter protects
+    /// syd and its process group, nothing else. So on a kernel without it
+    /// (Confidential ACI's has no Landlock at all), a worker CAN signal
+    /// another same-uid process: a known gap, reported by the tests below
+    /// instead of being asserted away.
+    fn kernel_scopes_signals() -> bool {
+        const SYS_LANDLOCK_CREATE_RULESET: libc::c_long = 444;
+        const LANDLOCK_CREATE_RULESET_VERSION: libc::c_ulong = 1;
+        // SAFETY: the documented way to query the Landlock ABI version
+        // (null attr, size 0, VERSION flag); takes no pointers.
+        let abi = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_CREATE_RULESET,
+                std::ptr::null::<libc::c_void>(),
+                0 as libc::size_t,
+                LANDLOCK_CREATE_RULESET_VERSION,
+            )
+        };
+        abi >= 6
+    }
+
+    fn py_bool(b: bool) -> &'static str {
+        if b { "True" } else { "False" }
+    }
+
+    fn bundle_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(std::env::var("ACI_TEST_BUNDLE_DIR").expect(
+            "ACI_TEST_BUNDLE_DIR must name an extracted worker-python-runtime directory \
+             (the one containing `runtime`); see aci/test-syd-sandbox.sh",
+        ))
+    }
+
+    /// Prelude every probe shares: `check(name, ok, detail)` prints
+    /// `PASS name` / `FAIL name :: detail`.
+    const PROBE_PRELUDE: &str = "\
+import os, sys, subprocess, shutil, socket, ctypes, signal, time
+def check(name, cond, detail=''):
+    print(('PASS ' if cond else 'FAIL ') + name + ('' if cond else ' :: ' + str(detail)))
+def writes(path):
+    try:
+        with open(path, 'w') as f:
+            f.write('x')
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
+def opens(path, mode='rb'):
+    try:
+        with open(path, mode) as f:
+            f.read(1) if 'r' in mode else None
+        return True
+    except OSError:
+        return False
+def ran(argv):
+    try:
+        subprocess.run(argv, capture_output=True, timeout=20)
+        return True
+    except OSError:
+        return False
+libc = ctypes.CDLL(None, use_errno=True)
+";
+
+    struct Probe {
+        stdout: String,
+        error: String,
+    }
+
+    impl Probe {
+        fn passes(&self) -> Vec<&str> {
+            self.stdout.lines().filter_map(|l| l.strip_prefix("PASS ")).collect()
+        }
+        fn failures(&self) -> Vec<&str> {
+            self.stdout.lines().filter(|l| l.starts_with("FAIL ")).collect()
+        }
+        /// Fails the test unless the probe ran to completion, printed no
+        /// FAIL line, and printed a PASS line for every name in `expected`
+        /// (so a probe that dies half way can't pass vacuously).
+        fn assert_clean(&self, expected: &[&str]) {
+            assert!(self.error.is_empty(), "probe crashed: {}\nstdout: {}", self.error, self.stdout);
+            assert!(self.failures().is_empty(), "isolation failures:\n{}", self.stdout);
+            let passes = self.passes();
+            for name in expected {
+                assert!(passes.contains(name), "probe never reported `{name}`:\n{}", self.stdout);
+            }
+        }
+    }
+
+    fn worker_command(drop_privileges: bool, timeout_secs: u64) -> Command {
+        let bundle = bundle_dir();
+        let rules = syd_policy(Some(&bundle)).expect("policy");
+        let entry_point = bundle.join("runtime");
+        syd_command(timeout_secs, &rules, drop_privileges, entry_point.to_str().unwrap(), &[])
+    }
+
+    async fn start_probe(code: &str, drop_privileges: bool) -> tokio::process::Child {
+        if drop_privileges {
+            assert!(running_as_root(), "this test needs root (it checks the privilege drop); aci/test-syd-sandbox.sh runs as root");
+        }
+        let request = serde_json::json!({
+            "storage_grant": {}, "world": false, "mode": "repl",
+            "code": format!("{PROBE_PRELUDE}{code}"),
+        });
+        let mut child = worker_command(drop_privileges, 90)
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn syd worker");
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(request.to_string().as_bytes()).await.unwrap();
+        drop(stdin);
+        child
+    }
+
+    async fn finish_probe(child: tokio::process::Child) -> Probe {
+        let output = child.wait_with_output().await.expect("wait for worker");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+            Ok(v) => Probe {
+                stdout: v["stdout"].as_str().unwrap_or_default().to_string(),
+                error: v["error"].as_str().unwrap_or_default().to_string(),
+            },
+            Err(e) => Probe {
+                stdout: String::new(),
+                error: format!("no JSON response ({e}); status {}; syd said: {}", output.status, truncate_for_log(&stderr)),
+            },
+        }
+    }
+
+    async fn probe(code: &str, drop_privileges: bool) -> Probe {
+        finish_probe(start_probe(code, drop_privileges).await).await
+    }
+
+    #[tokio::test]
+    #[ignore = "needs syd on PATH; see aci/test-syd-sandbox.sh"]
+    async fn syd_self_test_passes_on_a_host_with_syd() {
+        let _guard = GLOBAL_STATE.lock().await;
+        // syd's own stderr (which rule was missing) is logged by
+        // syd_self_test() on failure; show it.
+        let _ = env_logger::builder().is_test(true).try_init();
+        assert!(syd_self_test().await, "syd_self_test() failed -- see the log above (run with RUST_LOG=error)");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs syd and a worker bundle; see aci/test-syd-sandbox.sh"]
+    async fn syd_denies_exec_of_anything_not_allowlisted() {
+        let probe = probe(
+            "\
+check('system shell runs', subprocess.run(['/bin/sh', '-c', 'echo ok'], capture_output=True).stdout.strip() == b'ok')
+check('exec /usr/bin/id denied', not ran(['/usr/bin/id']))
+check('exec /usr/bin/awk denied', not ran(['/usr/bin/awk', 'BEGIN{}']))
+r = subprocess.run(['/bin/sh', '-c', '/usr/bin/id >/dev/null 2>&1'], capture_output=True)
+check('exec from inside the shell denied', r.returncode != 0)
+# A binary the worker drops into /tmp itself is not exec'able (only
+# /tmp/reviewer is), even a copy of an allowlisted one.
+shutil.copy('/bin/sh', '/tmp/dropped-sh')
+os.chmod('/tmp/dropped-sh', 0o755)
+check('exec of a copy dropped in /tmp denied', not ran(['/tmp/dropped-sh', '-c', 'echo x']))
+os.unlink('/tmp/dropped-sh')
+# ...nor a script, via its interpreter line, outside /tmp/reviewer.
+with open('/tmp/dropped.sh', 'w') as f:
+    f.write('#!/bin/sh\\necho x\\n')
+os.chmod('/tmp/dropped.sh', 0o755)
+check('exec of a script dropped in /tmp denied', not ran(['/tmp/dropped.sh']))
+os.unlink('/tmp/dropped.sh')
+# The one intended exception: the reviewer bundle's fixed path.
+os.makedirs('/tmp/reviewer', exist_ok=True)
+with open('/tmp/reviewer/init', 'w') as f:
+    f.write('#!/bin/sh\\nmkdir -p /tmp/reviewer/work && cp /etc/hosts /tmp/reviewer/work/hosts && echo init-ok\\n')
+os.chmod('/tmp/reviewer/init', 0o755)
+r = subprocess.run(['/tmp/reviewer/init'], capture_output=True, text=True)
+check('/tmp/reviewer/init runs (mkdir, cp via the allowlist)', r.stdout.strip() == 'init-ok', r)
+shutil.rmtree('/tmp/reviewer')
+",
+            false,
+        )
+        .await;
+        probe.assert_clean(&[
+            "system shell runs",
+            "exec /usr/bin/id denied",
+            "exec /usr/bin/awk denied",
+            "exec from inside the shell denied",
+            "exec of a copy dropped in /tmp denied",
+            "exec of a script dropped in /tmp denied",
+            "/tmp/reviewer/init runs (mkdir, cp via the allowlist)",
+        ]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs syd and a worker bundle; see aci/test-syd-sandbox.sh"]
+    async fn syd_denies_writes_outside_tmp() {
+        let bundle = bundle_dir();
+        let probe = probe(
+            &format!(
+                "\
+for p in ['/etc/aci-iso', '/usr/aci-iso', '/usr/bin/aci-iso', '/aci-iso', '/var/tmp/aci-iso', '/root/aci-iso', '/dev/aci-iso', '/opt/aci-iso', '{bundle}/aci-iso', '{bundle}/runtime-overwrite']:
+    check('no write ' + p, not writes(p))
+for fn, name in [(lambda: os.mkdir('/etc/aci-dir'), 'mkdir /etc'), (lambda: os.symlink('/etc/hosts', '/usr/aci-link'), 'symlink /usr'), (lambda: os.chmod('/etc/hosts', 0o777), 'chmod /etc/hosts'), (lambda: os.rename('/etc/hosts', '/etc/hosts.moved'), 'rename /etc/hosts'), (lambda: os.unlink('/etc/hosts'), 'unlink /etc/hosts'), (lambda: os.truncate('/etc/hosts', 0), 'truncate /etc/hosts'), (lambda: os.utime('/etc/hosts', (0, 0)), 'utime /etc/hosts')]:
+    try:
+        fn(); ok = False
+    except OSError:
+        ok = True
+    check('denied: ' + name, ok)
+# The bundle -- the interpreter the next job execs -- is read-only,
+# including its files, not just its directory.
+check('bundle runtime is not writable', not opens('{bundle}/runtime', 'r+'))
+check('bundle site-packages is not writable', not writes('{bundle}/lib/python3.12/site-packages/aci-iso.py'))
+# /tmp itself is the one writable place.
+check('write /tmp ok', writes('/tmp/aci-iso-ok'))
+import tempfile
+d = tempfile.mkdtemp()
+check('mkdtemp in /tmp ok', os.path.isdir(d))
+os.rmdir(d)
+",
+                bundle = bundle.display()
+            ),
+            false,
+        )
+        .await;
+        probe.assert_clean(&[
+            "no write /etc/aci-iso",
+            "no write /usr/aci-iso",
+            "no write /aci-iso",
+            "denied: rename /etc/hosts",
+            "bundle runtime is not writable",
+            "bundle site-packages is not writable",
+            "write /tmp ok",
+            "mkdtemp in /tmp ok",
+        ]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs syd and a worker bundle; see aci/test-syd-sandbox.sh"]
+    async fn syd_hides_the_sev_device_and_session_masters_memory_and_fds() {
+        // Stand-ins for what session_master has in production, owned by
+        // *this* process (and readable by the worker's identity, since the
+        // probe runs with the same uid): a world-readable "sev-guest" (only
+        // creatable when root and /dev is writable, as in the image), an
+        // open file descriptor, and this process's own /proc entries.
+        let sev = std::path::Path::new("/dev/sev-guest");
+        let created_sev = std::fs::write(sev, b"attestation-report-stand-in").is_ok();
+        if created_sev {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(sev, std::fs::Permissions::from_mode(0o666));
+        }
+        let secret_path = std::env::temp_dir().join(format!("aci-iso-secret-{}", std::process::id()));
+        std::fs::write(&secret_path, b"session-key-stand-in").unwrap();
+        let secret = std::fs::File::open(&secret_path).unwrap();
+        use std::os::unix::io::AsRawFd;
+        let fd = secret.as_raw_fd();
+        let me = std::process::id();
+        let magic = Box::new(MAGIC);
+        let magic_addr = &*magic as *const u64 as usize;
+        let result = probe(
+            &format!(
+                "{PEEK_PRELUDE}
+check('/dev/sev-guest unreadable', not opens('/dev/sev-guest'))
+check('/dev/sev-guest unwritable', not opens('/dev/sev-guest', 'wb'))
+check('/dev/sev-guest invisible', not os.path.exists('/dev/sev-guest'))
+me = {me}
+ppid = os.getppid()
+for pid, who in [(1, 'init'), (me, 'session_master stand-in'), (ppid, 'syd')]:
+    for leaf in ['environ', 'mem', 'maps', 'cmdline', 'status', 'stat', 'cwd', 'root', 'exe', 'fd', 'auxv']:
+        check('/proc/%d/%s unreachable (%s)' % (pid, leaf, who), not os.path.exists('/proc/%d/%s' % (pid, leaf)) and not opens('/proc/%d/%s' % (pid, leaf)))
+check('inherited fd {fd} unreachable via /proc', not opens('/proc/{me}/fd/{fd}'))
+def listable(path):
+    try:
+        os.listdir(path); return True
+    except OSError:
+        return False
+check('/proc not listable', not listable('/proc'))
+# The session_master's file descriptor was not inherited either: no open
+# fd above stderr in this process.
+leaked = []
+for n in range(3, 256):
+    try:
+        os.fstat(n); leaked.append(n)
+    except OSError:
+        pass
+check('no inherited file descriptors above stderr', leaked == [], leaked)
+# Cross-process memory access: neither ptrace nor process_vm_readv may
+# return the stand-in's secret.
+words = stolen_words(me, {addr})
+check('ptrace peek of session_master stand-in read nothing', words[0] != {magic}, words)
+check('process_vm_readv of session_master stand-in read nothing', words[1] != {magic}, words)
+",
+                me = me,
+                fd = fd,
+                addr = magic_addr,
+                magic = MAGIC,
+            ),
+            false,
+        )
+        .await;
+        drop(secret);
+        drop(magic);
+        let _ = std::fs::remove_file(&secret_path);
+        if created_sev {
+            let _ = std::fs::remove_file(sev);
+        }
+        result.assert_clean(&[
+            "/dev/sev-guest unreadable",
+            "/dev/sev-guest unwritable",
+            "/dev/sev-guest invisible",
+            "/proc not listable",
+            "no inherited file descriptors above stderr",
+            "ptrace peek of session_master stand-in read nothing",
+            "process_vm_readv of session_master stand-in read nothing",
+        ]);
+    }
+
+    /// Python helpers for the ptrace/process_vm_readv probes: try to read
+    /// the 8-byte magic at `addr` in process `pid` (a ptrace PEEKDATA after
+    /// an ATTACH, and a process_vm_readv), returning the values obtained.
+    /// syd makes ptrace(2) a stealth no-op that reports success, so the
+    /// assertion is never "the call errored" but "the target's secret did
+    /// not come back".
+    const PEEK_PRELUDE: &str = "\
+class iovec(ctypes.Structure):
+    _fields_ = [('base', ctypes.c_void_p), ('len', ctypes.c_size_t)]
+libc.ptrace.restype = ctypes.c_long
+libc.ptrace.argtypes = [ctypes.c_long, ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p]
+def stolen_words(pid, addr):
+    got = []
+    libc.ptrace(16, pid, None, None)   # PTRACE_ATTACH
+    ctypes.set_errno(0)
+    got.append(libc.ptrace(2, pid, ctypes.c_void_p(addr), None) & 0xFFFFFFFFFFFFFFFF)   # PTRACE_PEEKDATA
+    libc.ptrace(17, pid, None, None)   # PTRACE_DETACH
+    buf = ctypes.c_uint64(0)
+    local = iovec(ctypes.cast(ctypes.byref(buf), ctypes.c_void_p), 8)
+    remote = iovec(ctypes.c_void_p(addr), 8)
+    libc.process_vm_readv.restype = ctypes.c_ssize_t
+    n = libc.process_vm_readv(pid, ctypes.byref(local), 1, ctypes.byref(remote), 1, 0)
+    got.append(buf.value if n == 8 else None)
+    return got
+";
+    const MAGIC: u64 = 0x1122_3344_5566_7788;
+
+    #[tokio::test]
+    #[ignore = "needs syd and a worker bundle; see aci/test-syd-sandbox.sh"]
+    async fn syd_denies_ptrace_and_signals_to_its_parent_and_the_session_master() {
+        // Same identity as this process (drop_privileges = false), so a
+        // refusal below is syd's, not the kernel's uid check.
+        //
+        // syd (the worker's parent) must always be unreachable. The
+        // session_master stand-in -- this process -- is unreachable to
+        // signals only where the *kernel* scopes them (see
+        // kernel_scopes_signals()); on other kernels we send it signal 0
+        // and nothing fatal, and report the gap. In production the real
+        // session_master is root and the worker is not, so the kernel's
+        // uid check covers it either way (syd_worker_runs_as_... tests it).
+        let magic = Box::new(MAGIC);
+        let magic_addr = &*magic as *const u64 as usize;
+        let me = std::process::id();
+        let scoped = kernel_scopes_signals();
+        eprintln!("kernel scopes signals (Landlock ABI >= 6): {scoped}");
+        let result = probe(
+            &format!(
+                "{PEEK_PRELUDE}
+ppid = os.getppid()
+scoped = {scoped}
+for pid, who in [(ppid, 'syd, the sandbox'), ({me}, 'session_master stand-in')]:
+    for sig, name in [(0, 'signal 0'), (signal.SIGTERM, 'SIGTERM'), (signal.SIGKILL, 'SIGKILL'), (signal.SIGSTOP, 'SIGSTOP')]:
+        if pid != ppid and not scoped and sig != 0:
+            continue   # would really kill/stop the test process
+        try:
+            os.kill(pid, sig); ok = False
+        except OSError:
+            ok = True
+        if not ok:
+            print('NOTE %s to %s was delivered (known gap: kernel lacks scoped signals)' % (name, who))
+        if pid == ppid or scoped:
+            check('%s to %s refused' % (name, who), ok)
+try:
+    os.kill(ppid, 0)
+    still_there = False
+except OSError:
+    still_there = True
+check('parent still unreachable after all of the above', still_there)
+# ptrace attach + process_vm_readv: the stand-in's secret must not come back.
+words = stolen_words({me}, {addr})
+check('ptrace attach + peek of the session_master stand-in read nothing', words[0] != {magic}, words)
+check('process_vm_readv of the session_master stand-in read nothing', words[1] != {magic}, words)
+# And the parent: attaching must not wedge or kill anything.
+stolen_words(ppid, 0x400000)
+check('ptrace attach of syd, the sandbox, was a no-op', True)
+",
+                me = me,
+                scoped = py_bool(scoped),
+                addr = magic_addr,
+                magic = MAGIC,
+            ),
+            false,
+        )
+        .await;
+        drop(magic);
+        let mut expected = vec![
+            "SIGKILL to syd, the sandbox refused",
+            "SIGTERM to syd, the sandbox refused",
+            "SIGSTOP to syd, the sandbox refused",
+            "signal 0 to syd, the sandbox refused",
+            "parent still unreachable after all of the above",
+            "ptrace attach + peek of the session_master stand-in read nothing",
+            "process_vm_readv of the session_master stand-in read nothing",
+            "ptrace attach of syd, the sandbox, was a no-op",
+        ];
+        if scoped {
+            expected.push("SIGKILL to session_master stand-in refused");
+        }
+        result.assert_clean(&expected);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs syd, a worker bundle and root; see aci/test-syd-sandbox.sh"]
+    async fn syd_worker_runs_as_the_unprivileged_worker_identity() {
+        // The real invocation: root session_master -> timeout -> setpriv ->
+        // syd -> worker. This process stands in for session_master.
+        let me = std::process::id();
+        let result = probe(
+            &format!(
+                "\
+check('uid is the worker uid', (os.getuid(), os.geteuid()) == ({uid}, {uid}), (os.getuid(), os.geteuid()))
+check('gid is the worker gid', (os.getgid(), os.getegid()) == ({gid}, {gid}), (os.getgid(), os.getegid()))
+check('never uid 0', os.getuid() != 0 and os.geteuid() != 0)
+check('no supplementary groups (root group dropped)', os.getgroups() == [], os.getgroups())
+try:
+    os.setuid(0); regained = True
+except OSError:
+    regained = False
+check('cannot regain root with setuid(0)', not regained)
+try:
+    os.kill({me}, 0); signalled = True
+except OSError:
+    signalled = False
+check('cannot signal the root session_master', not signalled)
+check('cannot read root-only files', not opens('/etc/shadow'))
+",
+                uid = worker_uid(),
+                gid = worker_gid(),
+                me = me
+            ),
+            true,
+        )
+        .await;
+        result.assert_clean(&[
+            "uid is the worker uid",
+            "gid is the worker gid",
+            "never uid 0",
+            "no supplementary groups (root group dropped)",
+            "cannot regain root with setuid(0)",
+            "cannot signal the root session_master",
+        ]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs syd and a worker bundle; see aci/test-syd-sandbox.sh"]
+    async fn syd_concurrent_workers_cannot_see_or_inspect_each_other() {
+        // DIR-379's "two tenants on one worker" criterion, as far as this
+        // backend meets it. Worker A parks itself holding a secret in
+        // memory; worker B -- same identity, same container, running at
+        // the same time -- tries to find and inspect it. (B reading A's
+        // files under /tmp is *not* in this list: /tmp is shared, see
+        // syd_concurrent_workers_share_tmp_known_gap. Nor is B signalling
+        // A on a kernel without scoped signals; see kernel_scopes_signals().)
+        let flag = format!("/tmp/aci-iso-{}", std::process::id());
+        let _ = std::fs::remove_file(format!("{flag}-pid"));
+        let _ = std::fs::remove_file(format!("{flag}-go"));
+        let a = start_probe(
+            &format!(
+                "\
+secret = ctypes.c_uint64({MAGIC})
+open('{flag}-pid.tmp', 'w').write('%d %d' % (os.getpid(), ctypes.addressof(secret)))
+os.rename('{flag}-pid.tmp', '{flag}-pid')
+for _ in range(1200):
+    if os.path.exists('{flag}-go'):
+        break
+    time.sleep(0.05)
+check('A finished', secret.value == {MAGIC})
+"
+            ),
+            false,
+        )
+        .await;
+        let mut target = None;
+        for _ in 0..400 {
+            if let Ok(s) = std::fs::read_to_string(format!("{flag}-pid")) {
+                let mut it = s.split_whitespace().map(|x| x.parse::<u64>());
+                if let (Some(Ok(pid)), Some(Ok(addr))) = (it.next(), it.next()) {
+                    target = Some((pid, addr));
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let (pid_a, addr_a) = target.expect("worker A never reported its pid");
+        let scoped = kernel_scopes_signals();
+        let b = probe(
+            &format!(
+                "{PEEK_PRELUDE}
+a, addr = {pid_a}, {addr_a}
+scoped = {scoped}
+for leaf in ['environ', 'mem', 'maps', 'cmdline', 'status', 'cwd', 'root', 'exe', 'fd']:
+    check('/proc/A/%s unreachable' % leaf, not os.path.exists('/proc/%d/%s' % (a, leaf)) and not opens('/proc/%d/%s' % (a, leaf)))
+def listed_pids():
+    try:
+        return [x for x in os.listdir('/proc') if x.isdigit()]
+    except OSError:
+        return []
+check('/proc lists no processes', listed_pids() == [], listed_pids())
+for sig, name in [(0, 'signal 0'), (signal.SIGSTOP, 'SIGSTOP'), (signal.SIGKILL, 'SIGKILL')]:
+    if not scoped and sig != 0:
+        continue   # would really stop/kill A
+    try:
+        os.kill(a, sig); ok = False
+    except OSError:
+        ok = True
+    if not ok:
+        print('NOTE %s to A was delivered (known gap: kernel lacks scoped signals)' % name)
+    if scoped:
+        check('%s to A refused' % name, ok)
+words = stolen_words(a, addr)
+check('ptrace attach + peek of A read nothing', words[0] != {MAGIC}, words)
+check('process_vm_readv of A read nothing', words[1] != {MAGIC}, words)
+",
+                pid_a = pid_a,
+                addr_a = addr_a,
+                scoped = py_bool(scoped),
+            ),
+            false,
+        )
+        .await;
+        std::fs::write(format!("{flag}-go"), b"go").unwrap();
+        let a = finish_probe(a).await;
+        let _ = std::fs::remove_file(format!("{flag}-pid"));
+        let _ = std::fs::remove_file(format!("{flag}-go"));
+        a.assert_clean(&["A finished"]);
+        let mut expected = vec![
+            "/proc/A/environ unreachable",
+            "/proc/A/mem unreachable",
+            "/proc lists no processes",
+            "ptrace attach + peek of A read nothing",
+            "process_vm_readv of A read nothing",
+        ];
+        if scoped {
+            expected.extend(["SIGKILL to A refused", "SIGSTOP to A refused"]);
+        }
+        b.assert_clean(&expected);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs syd and a worker bundle; see aci/test-syd-sandbox.sh"]
+    async fn syd_concurrent_workers_share_tmp_known_gap() {
+        // KNOWN GAP, asserted so it can't be forgotten: this backend has no
+        // mount namespace (see the "worker execution, via syd" comment --
+        // syd's mount namespace needs a private procfs, which a Confidential
+        // ACI container refuses), so /tmp is the container's own and two
+        // concurrent workers *can* read each other's files there. bubblewrap
+        // gives each worker a fresh tmpfs. When this backend gains private
+        // /tmp, this test must flip to asserting isolation.
+        let path = format!("/tmp/aci-iso-shared-{}", std::process::id());
+        let a = probe(&format!("open('{path}', 'w').write('tenant-A-secret'); check('A wrote', True)"), false).await;
+        a.assert_clean(&["A wrote"]);
+        let b = probe(
+            &format!("check('B can read A\\'s /tmp file (known gap)', open('{path}').read() == 'tenant-A-secret')"),
+            false,
+        )
+        .await;
+        let _ = std::fs::remove_file(&path);
+        b.assert_clean(&["B can read A's /tmp file (known gap)"]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs syd and a worker bundle; see aci/test-syd-sandbox.sh"]
+    async fn syd_does_not_hand_session_masters_secrets_to_the_worker() {
+        // syd clears environment variables whose names look like secrets
+        // (*ACCESS*, *AUTH*, *KEY*, *TOKEN*, ... -- `syd-ls env`) from the
+        // sandboxed process's initial environment. bubblewrap passes the
+        // whole inherited environment through, so under bwrap worker code
+        // can read ACI_CALLBACK_TOKEN and the worker-runtime S3 credential.
+        // This pins the syd side of that difference. (A variable the worker
+        // legitimately needs would have to be passed with syd's `-e VAR=`;
+        // none is today -- worker.py reads its credentials from the
+        // request, and world_core.py's env reads are fallbacks.)
+        let _guard = GLOBAL_STATE.lock().await;
+        let secrets = [
+            ("ACI_CALLBACK_TOKEN", "callback-token-stand-in"),
+            ("ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY", "s3-secret-stand-in"),
+            ("ACI_WORKER_RUNTIME_ACCESS_KEY_ID", "s3-key-id-stand-in"),
+        ];
+        for (name, value) in secrets {
+            std::env::set_var(name, value);
+        }
+        let result = probe(
+            "\
+for name in ['ACI_CALLBACK_TOKEN', 'ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY', 'ACI_WORKER_RUNTIME_ACCESS_KEY_ID']:
+    check('%s not in the worker environment' % name, name not in os.environ)
+check('LD_PRELOAD cannot be smuggled in', 'LD_PRELOAD' not in os.environ)
+check('PYTHONDONTWRITEBYTECODE is set (bwrap --setenv parity)', os.environ.get('PYTHONDONTWRITEBYTECODE') == '1')
+",
+            false,
+        )
+        .await;
+        for (name, _) in secrets {
+            std::env::remove_var(name);
+        }
+        result.assert_clean(&[
+            "ACI_CALLBACK_TOKEN not in the worker environment",
+            "ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY not in the worker environment",
+            "PYTHONDONTWRITEBYTECODE is set (bwrap --setenv parity)",
+        ]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs syd and a worker bundle; see aci/test-syd-sandbox.sh"]
+    async fn syd_denies_listening_raw_sockets_and_local_sockets() {
+        let result = probe(
+            "\
+def attempt(fn):
+    try:
+        fn(); return True
+    except OSError:
+        return False
+def tcp_listen():
+    s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen()
+def tcp_listen_any():
+    s = socket.socket(); s.bind(('0.0.0.0', 0)); s.listen()
+def udp_bind():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('127.0.0.1', 0))
+def unix_bind():
+    s = socket.socket(socket.AF_UNIX); s.bind('/tmp/aci-iso.sock')
+def unix_connect():
+    s = socket.socket(socket.AF_UNIX); s.connect('/var/run/docker.sock')
+def abstract_connect():
+    s = socket.socket(socket.AF_UNIX); s.connect('\\0aci-iso')
+check('tcp bind+listen denied', not attempt(tcp_listen))
+check('tcp bind 0.0.0.0 denied', not attempt(tcp_listen_any))
+check('udp bind denied', not attempt(udp_bind))
+check('unix bind denied', not attempt(unix_bind))
+check('unix connect denied', not attempt(unix_connect))
+check('abstract unix connect denied', not attempt(abstract_connect))
+check('raw ip socket denied', not attempt(lambda: socket.socket(socket.AF_INET, socket.SOCK_RAW, 1)))
+check('packet socket denied', not attempt(lambda: socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)))
+check('netlink socket denied', not attempt(lambda: socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)))
+",
+            false,
+        )
+        .await;
+        result.assert_clean(&[
+            "tcp bind+listen denied",
+            "tcp bind 0.0.0.0 denied",
+            "udp bind denied",
+            "unix bind denied",
+            "unix connect denied",
+            "abstract unix connect denied",
+            "raw ip socket denied",
+            "packet socket denied",
+            "netlink socket denied",
+        ]);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs syd and a worker bundle; see aci/test-syd-sandbox.sh"]
+    async fn syd_worker_round_trip_through_run_worker() {
+        // The happy path, through the real run_worker(): backend selection,
+        // self-test, policy, privilege drop (when root), worker.py's real
+        // request/response over stdin/stdout, and a real queue_eval()
+        // dial into the real spawn_queue_listener().
+        let _guard = GLOBAL_STATE.lock().await;
+        let bundle = bundle_dir();
+        let _ = WORKER_RUNTIME.set(Ok(PinnedWorkerRuntime {
+            path: bundle.clone(),
+            sha256_hex: "0".repeat(64),
+        }));
+        let (addr, mut queued) = spawn_queue_listener("test-token".to_string()).await.unwrap();
+        let egress = std::env::var("ACI_TEST_EGRESS_URL").unwrap_or_default();
+        let code = format!(
+            "\
+import io, os, shutil, subprocess, tarfile, asyncio, hashlib, ssl, urllib.request
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import h2.connection, h2.config, hpack, hyperframe.frame
+from tlslite.utils.python_aesgcm import new as tls_aesgcm
+# cryptography / OpenSSL
+k = AESGCM.generate_key(256); n = os.urandom(12); a = AESGCM(k)
+assert a.decrypt(n, a.encrypt(n, b'hi', None), None) == b'hi'
+ssl.create_default_context()
+# h2 / hpack / hyperframe, tlslite-ng
+c = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=True)); c.initiate_connection()
+hpack.Encoder().encode([('a', 'b')])
+t = tls_aesgcm(bytearray(os.urandom(32))); nn = bytearray(os.urandom(12))
+assert bytes(t.open(nn, t.seal(nn, bytearray(b'x'), bytearray(b'')), bytearray(b''))) == b'x'
+# tarfile + subprocess: unpack to /tmp and run a script from it
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode='w:gz') as tf:
+    body = b'#!/bin/sh\\necho from-init\\n'
+    ti = tarfile.TarInfo('reviewer/init'); ti.size = len(body); ti.mode = 0o755
+    tf.addfile(ti, io.BytesIO(body))
+buf.seek(0)
+with tarfile.open(fileobj=buf, mode='r:gz') as tf:
+    tf.extractall('/tmp')
+out = subprocess.run(['/tmp/reviewer/init'], capture_output=True, text=True).stdout.strip()
+shutil.rmtree('/tmp/reviewer')
+# asyncio (epoll + socketpair): `repl` mode already runs inside an event loop
+async def f():
+    await asyncio.sleep(0.01)
+    return 'async-ok'
+res = await f()
+# queue_eval: loopback dial into session_master's own listener
+queue_eval(\"'tail-call'\")
+# outbound HTTPS, when the environment has any
+egress = '{egress}'
+status = urllib.request.urlopen(egress, timeout=30).status if egress else 'skipped'
+print(out, res, status)
+"
+        );
+        let request = serde_json::json!({
+            "mode": "repl", "world": false, "storage_grant": {}, "code": code,
+            "queue_addr": addr.to_string(), "queue_token": "test-token",
+        });
+        let previous = std::env::var_os(SANDBOX_BACKEND_ENV);
+        std::env::set_var(SANDBOX_BACKEND_ENV, "syd");
+        let response = run_worker(&request, Duration::from_secs(120)).await;
+        match previous {
+            Some(v) => std::env::set_var(SANDBOX_BACKEND_ENV, v),
+            None => std::env::remove_var(SANDBOX_BACKEND_ENV),
+        }
+        assert_eq!(response["ok"], true, "{response}");
+        let stdout = response["stdout"].as_str().unwrap_or_default();
+        assert!(stdout.starts_with("from-init async-ok "), "{response}");
+        if !egress.is_empty() {
+            assert!(stdout.trim_end().ends_with("200"), "{response}");
+        }
+        let job = queued.try_recv().expect("the queued eval never reached the listener");
+        assert_eq!(job["code"], "'tail-call'");
     }
 }

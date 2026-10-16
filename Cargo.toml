@@ -80,5 +80,12 @@ uuid = { version = "1.0", features = ["v4"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 ring = "0.17.14"
 
+# session_master's syd sandbox backend only drops to the worker uid/gid when
+# this process is actually root (running_as_root()'s geteuid(2) call) -- an
+# unprivileged dev/test run has no identity to drop. Already in Cargo.lock
+# transitively (tokio's own dependency); declared here only so this binary
+# can name it directly.
+libc = "0.2"
+
 [dev-dependencies]
 tokio-test = "0.4"

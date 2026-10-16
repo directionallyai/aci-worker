@@ -15,6 +15,7 @@ dependencies = [
  "hex",
  "hkdf",
  "http",
+ "libc",
  "log",
  "p256",
  "rand 0.8.8",
