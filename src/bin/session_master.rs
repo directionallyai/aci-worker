@@ -90,9 +90,10 @@
 //!      runtime (interpreter, its own dependencies, worker.py/storage.py
 //!      themselves, all published from worker-python-runtime, a
 //!      separate, public repo) -- extracts it, and execs its own
-//!      `runtime` entry point natively inside a bubblewrap sandbox
-//!      (unprivileged user/mount/pid namespace confinement -- see that
-//!      function's own doc comment), feeding it {mode, code,
+//!      `runtime` entry point natively inside a sandbox -- bubblewrap
+//!      (unprivileged user/mount/pid namespace confinement, the default)
+//!      or syd (seccomp-unotify), per ACI_WORKER_SANDBOX; see
+//!      run_worker()'s own doc comment -- feeding it {mode, code,
 //!      storage_grant, pattern_delegate} on stdin the same shape
 //!      worker.py's own handle() already expects
 //!   10. encrypt the result (AAD "server-to-client"), write it, exit
@@ -813,7 +814,7 @@ pub async fn get_maa_token(
     }
 } // mod aci_attestation
 
-// -- worker execution, via bubblewrap ----------------------------------------
+// -- worker execution: sandbox backends -----------------------------------
 //
 // This image carries no Python and no baked-in worker.py/storage.py at
 // all -- every session fetches its own self-contained runtime tarball
@@ -834,6 +835,14 @@ pub async fn get_maa_token(
 // primitive (used by Flatpak sandboxing, among others) -- a real,
 // maintained project, not something hand-rolled the way sandlock's own
 // fork was.
+//
+// syd (seccomp-unotify) is a second, opt-in backend alongside it, chosen
+// per container by ACI_WORKER_SANDBOX (SANDBOX_BACKEND_ENV; bwrap stays the
+// default). Production has no seccomp filter today -- bubblewrap alone,
+// namespaces only -- and syd adds a syscall-level policy that needs
+// nothing the ACI node kernel lacks (Linux >= 5.19, no Landlock). It
+// replaces nothing yet: see the "worker execution, via syd" section below
+// for what it does and does not give up relative to bubblewrap.
 const BWRAP_BIN: &str = "bwrap";
 
 /// Fetches, verifies, and extracts a worker runtime bundle -- a tar.gz
@@ -2849,6 +2858,28 @@ mod sandbox_backend_tests {
         assert_eq!(dropped[9..], ["syd", "-m", "sandbox/all:on", "-e", "PYTHONDONTWRITEBYTECODE=1", "--", "/entry", "a"]);
         let kept = args_of(false);
         assert_eq!(kept[..6], ["-s", "9", "-k", "5", "7", "syd"]);
+    }
+
+    #[test]
+    fn bwrap_invocation_is_exactly_what_it_was_before_the_syd_backend() {
+        // The default backend's argv, pinned: the syd backend must not
+        // have touched it (it was moved out of run_worker() unchanged).
+        let command = bwrap_worker_command(Duration::from_secs(300), "/tmp/b/runtime", "/tmp/b/runtime/runtime");
+        let std = command.as_std();
+        assert_eq!(std.get_program(), "timeout");
+        let args: Vec<String> = std.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let uid = worker_uid().to_string();
+        let gid = worker_gid().to_string();
+        let expected = [
+            "-s", "9", "-k", "5", "300", "bwrap", "--unshare-all", "--share-net", "--die-with-parent",
+            "--new-session", "--dev", "/dev", "--ro-bind", "/bin", "/bin", "--ro-bind", "/usr", "/usr",
+            "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64", "--ro-bind", "/etc/ssl",
+            "/etc/ssl", "--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf", "--ro-bind", "/etc/hosts",
+            "/etc/hosts", "--tmpfs", "/tmp", "--chmod", "1777", "/tmp", "--setenv",
+            "PYTHONDONTWRITEBYTECODE", "1", "--uid", uid.as_str(), "--gid", gid.as_str(), "--ro-bind",
+            "/tmp/b/runtime", "/tmp/b/runtime", "--", "/tmp/b/runtime/runtime",
+        ];
+        assert_eq!(args, expected);
     }
 
     #[tokio::test]
