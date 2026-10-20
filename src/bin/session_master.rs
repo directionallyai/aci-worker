@@ -1900,7 +1900,7 @@ async fn dial_callback(
         .ready()
         .await
         .map_err(|e| SessionError::Protocol(format!("h2 connection not ready: {e}")))?;
-    log::info!("dial_callback: h2 ready, sending callback request with token={token}");
+    log::info!("dial_callback: h2 ready, sending callback request");
     let (response, send) = ready
         .send_request(request, false)
         .map_err(|e| SessionError::Protocol(format!("could not send callback request: {e}")))?;
