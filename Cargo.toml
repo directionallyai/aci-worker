@@ -18,6 +18,15 @@ default = []
 # (src/bin/session_master.rs's own aci_attestation module) and its `sev`
 # dependency below for nothing.
 aci-attestation = ["dep:sev"]
+# Test/dev-only: compiles session_master's mock MAA attestation path
+# (MOCK_MAA_TOKEN and the ATTESTER_MOCK_ATTESTATION branch in
+# aci_callback_handler()) in. Off by default and deliberately NOT passed by
+# aci/Dockerfile or any CI build that publishes an image -- without this
+# feature the mock token string is not in the binary at all, so the
+# release/Docker image cannot send mock attestation whatever its
+# environment says. Implies aci-attestation, since the mock path lives in
+# that feature's own ACI handler.
+mock-attestation = ["aci-attestation"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
