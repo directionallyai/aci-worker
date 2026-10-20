@@ -54,6 +54,15 @@ Built without `--features aci-attestation`, `session_master` logs an
 error and exits immediately -- ACI mode is the only mode this binary
 supports.
 
+Mock attestation (`ATTESTER_MOCK_ATTESTATION`, which swaps the real MAA
+token for a fixed placeholder) is test/dev-only and needs a separate
+`cargo build --features mock-attestation` build (implies
+`aci-attestation`). `aci/Dockerfile` never passes that feature: the
+release/Docker image does not contain the mock token at all, so it cannot
+produce mock attestations whatever its environment says -- there,
+`session_master` logs an error that `ATTESTER_MOCK_ATTESTATION` is ignored
+and attests for real.
+
 ```bash
 docker build -f aci/Dockerfile -t aci-session-worker .
 ```
