@@ -166,6 +166,68 @@ fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
+/// The broker-forwarded secrets this process needs for its own work
+/// (dialing the callback listener, fetching the worker bundle) -- and
+/// that must never be visible to the worker it spawns.
+///
+/// take_from_env() moves them out of the process environment into owned
+/// values and unsets the variables, so nothing spawned later (even by
+/// accident, from a code path that forgot env_clear()) inherits them.
+/// It must run from a plain synchronous main() *before* the tokio
+/// runtime (and so any other thread) exists: `std::env::remove_var` is
+/// not safe against concurrent environment access from other threads.
+///
+/// What this does not do: Linux keeps the *initial* environment block
+/// readable at /proc/<pid>/environ regardless of later unsetenv, and the
+/// values still live in this process's memory (they have to -- they're
+/// used for the dial and the S3 fetch). The sandboxed worker can't reach
+/// either (separate pid namespace, no /proc mounted, different uid), so
+/// this is defense in depth for child-process inheritance, not a
+/// guarantee against a compromised session_master itself.
+#[derive(Default)]
+struct BrokerSecrets {
+    callback_token: String,
+    runtime_access_key_id: String,
+    runtime_secret_access_key: String,
+    /// ACI_WORKER_RUNTIME_SESSION_TOKEN: only present when the broker
+    /// injects a short-lived per-launch credential.
+    runtime_session_token: Option<String>,
+}
+
+impl BrokerSecrets {
+    const ENV_NAMES: [&'static str; 4] = [
+        "ACI_CALLBACK_TOKEN",
+        "ACI_WORKER_RUNTIME_ACCESS_KEY_ID",
+        "ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY",
+        "ACI_WORKER_RUNTIME_SESSION_TOKEN",
+    ];
+
+    /// Single-threaded startup only -- see the type's own doc comment.
+    fn take_from_env() -> Self {
+        let secrets = Self::from_lookup(|name| std::env::var(name).ok());
+        for name in Self::ENV_NAMES {
+            std::env::remove_var(name);
+        }
+        secrets
+    }
+
+    fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Self {
+        BrokerSecrets {
+            callback_token: get("ACI_CALLBACK_TOKEN").unwrap_or_default(),
+            runtime_access_key_id: get("ACI_WORKER_RUNTIME_ACCESS_KEY_ID").unwrap_or_default(),
+            runtime_secret_access_key: get("ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY").unwrap_or_default(),
+            runtime_session_token: get("ACI_WORKER_RUNTIME_SESSION_TOKEN").filter(|t| !t.is_empty()),
+        }
+    }
+}
+
+// Hand-written so a stray `{:?}` can never print a secret.
+impl std::fmt::Debug for BrokerSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BrokerSecrets { .. }")
+    }
+}
+
 /// Deliberately duplicated from attested-python-execution's own
 /// attestation::mock_attestation_enabled(), not depended on: this is the
 /// one place this binary needs it, it's a trivial env-var truthy-check
@@ -782,6 +844,117 @@ pub async fn get_maa_token(
 // fork was.
 const BWRAP_BIN: &str = "bwrap";
 
+/// The complete environment the sandboxed worker sees -- nothing else.
+/// Both the real worker invocation and the self-test pass exactly this
+/// list (via `--clearenv` + `--setenv`), so the self-test exercises the
+/// same shape as the real thing.
+///
+/// Why each entry (worker.py and storage.py read no environment
+/// variables at all -- checked in worker-python-runtime):
+/// - `PATH`: the bundle's `runtime` entry point is a `#!/bin/sh` script
+///   that calls `dirname`; a worker that shells out needs it too.
+///   `/usr/bin:/bin` are the only executable trees bound in.
+/// - `HOME=/tmp`: the only writable directory; keeps anything that
+///   expands `~` off a nonexistent path.
+/// - `PYTHONDONTWRITEBYTECODE=1`: the bundle is mounted read-only.
+///
+/// No `LANG`/`LC_ALL`: CPython 3.7+ coerces the legacy C locale to UTF-8
+/// by itself. No `SSL_CERT_*`: the interpreter's default CA path is
+/// `/etc/ssl`, which is bound. Add a variable here only with a concrete
+/// reason; `ACI_*` and every other broker/launch variable must never
+/// appear (a unit test enforces the `ACI_*` part).
+const WORKER_SANDBOX_ENV: [(&str, &str); 3] = [
+    ("PATH", "/usr/bin:/bin"),
+    ("HOME", "/tmp"),
+    ("PYTHONDONTWRITEBYTECODE", "1"),
+];
+
+/// `PATH` for the unsandboxed `timeout`/`bwrap` wrapper processes
+/// themselves -- they get nothing else either.
+const WRAPPER_PATH: &str = "/usr/bin:/bin";
+
+/// Clears the inherited environment on the spawned wrapper (`timeout`,
+/// then bwrap itself) and gives it only a fixed PATH to resolve
+/// `timeout`/`bwrap`. Together with bwrap's own `--clearenv` this means
+/// the worker can't inherit session_master's environment -- the
+/// broker-forwarded secrets above all -- even if one layer is changed.
+fn clean_wrapper_env(c: &mut Command) {
+    c.env_clear().env("PATH", WRAPPER_PATH);
+}
+
+/// `--clearenv` and then `--setenv` for exactly WORKER_SANDBOX_ENV.
+/// `--clearenv` must come first: it unsets everything set so far.
+fn push_sandbox_env_args(c: &mut Command) {
+    c.arg("--clearenv");
+    for (name, value) in WORKER_SANDBOX_ENV {
+        c.arg("--setenv").arg(name).arg(value);
+    }
+}
+
+/// bwrap_self_test()'s command, split out so a unit test can inspect it.
+fn bwrap_self_test_command() -> Command {
+    let mut c = Command::new("timeout");
+    clean_wrapper_env(&mut c);
+    c.arg("-s").arg("9")
+        .arg("-k").arg("2")
+        .arg("5")
+        .arg(BWRAP_BIN)
+        .arg("--unshare-all").arg("--share-net")
+        .arg("--die-with-parent")
+        .arg("--new-session")
+        .arg("--dev").arg("/dev")
+        .arg("--ro-bind").arg("/bin").arg("/bin")
+        .arg("--ro-bind").arg("/usr").arg("/usr")
+        .arg("--ro-bind").arg("/lib").arg("/lib")
+        .arg("--ro-bind").arg("/lib64").arg("/lib64");
+    push_sandbox_env_args(&mut c);
+    c.arg("--").arg("true");
+    c
+}
+
+/// run_worker()'s command (before stdio/kill_on_drop are applied), split
+/// out so a unit test can inspect it. See run_worker()'s doc comment for
+/// what each mount is for and why they're ordered this way.
+fn worker_sandbox_command(
+    timeout: Duration,
+    uid: u32,
+    gid: u32,
+    bundle: &str,
+    entry_point: &str,
+) -> Command {
+    let mut c = Command::new("timeout");
+    clean_wrapper_env(&mut c);
+    c.arg("-s").arg("9")
+        .arg("-k").arg("5")
+        .arg(timeout.as_secs().to_string())
+        .arg(BWRAP_BIN)
+        .arg("--unshare-all").arg("--share-net")
+        .arg("--die-with-parent")
+        .arg("--new-session")
+        .arg("--dev").arg("/dev")
+        .arg("--ro-bind").arg("/bin").arg("/bin")
+        .arg("--ro-bind").arg("/usr").arg("/usr")
+        .arg("--ro-bind").arg("/lib").arg("/lib")
+        .arg("--ro-bind").arg("/lib64").arg("/lib64")
+        .arg("--ro-bind").arg("/etc/ssl").arg("/etc/ssl")
+        .arg("--ro-bind").arg("/etc/resolv.conf").arg("/etc/resolv.conf")
+        .arg("--ro-bind").arg("/etc/hosts").arg("/etc/hosts")
+        .arg("--tmpfs").arg("/tmp")
+        .arg("--chmod").arg("1777").arg("/tmp");
+    push_sandbox_env_args(&mut c);
+    c.arg("--uid").arg(uid.to_string())
+        .arg("--gid").arg(gid.to_string())
+        // The --ro-bind for the bundle dir must come after --tmpfs
+        // /tmp above, not before -- bwrap applies mount actions in
+        // argument order, and a bind targeting a path under /tmp
+        // issued before the fresh tmpfs is mounted there would just
+        // be shadowed by it.
+        .arg("--ro-bind").arg(bundle).arg(bundle)
+        .arg("--")
+        .arg(entry_point);
+    c
+}
+
 /// Fetches, verifies, and extracts a worker runtime bundle -- a tar.gz
 /// containing a self-contained Python interpreter, its own dependencies,
 /// and worker.py/storage.py themselves (worker-python-runtime, a
@@ -866,8 +1039,23 @@ async fn fetch_worker_bundle(
         .filter(|s| !s.is_empty())
         .unwrap_or("v4/assets/");
 
-    let credentials = Credentials::new(Some(&access_key_id), Some(&secret_access_key), None, None, None)
-        .map_err(|e| format!("worker_bundle credentials: {e}"))?;
+    // Optional: a short-lived per-launch credential carries a session
+    // token (signed into every request as `x-amz-security-token` --
+    // rust-s3 sends `session_token` under exactly that header); a
+    // long-lived key pair doesn't. Absent or empty = unchanged behaviour.
+    let session_token = storage_grant
+        .get("session_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let credentials = Credentials::new(
+        Some(&access_key_id),
+        Some(&secret_access_key),
+        None,
+        session_token.as_deref(),
+        None,
+    )
+    .map_err(|e| format!("worker_bundle credentials: {e}"))?;
     let bucket = Bucket::new(&bucket_name, Region::Custom { region, endpoint }, credentials)
         .map_err(|e| format!("worker_bundle bucket: {e}"))?
         .with_path_style();
@@ -959,11 +1147,19 @@ static WORKER_RUNTIME: tokio::sync::OnceCell<Result<PinnedWorkerRuntime, String>
 /// regeneration, the same property moving worker.py/storage.py out of
 /// this image's own build already bought for application-code changes.
 ///
+/// The credential comes from `secrets` (BrokerSecrets::take_from_env(),
+/// read and scrubbed from the process environment before any thread
+/// starts), not from `std::env` -- see that type's own doc comment. The
+/// optional ACI_WORKER_RUNTIME_SESSION_TOKEN rides along in the same
+/// struct for a short-lived (STS-style) credential.
+///
 /// Failing here is fatal, not a per-request error: a container that
 /// cannot resolve its own restricted runtime has nothing it could ever
 /// legitimately run, so main()'s own caller exits the process outright
 /// rather than dialing back with nothing to offer.
-async fn resolve_worker_runtime_at_startup() -> Result<PinnedWorkerRuntime, String> {
+async fn resolve_worker_runtime_at_startup(
+    secrets: &BrokerSecrets,
+) -> Result<PinnedWorkerRuntime, String> {
     let sha256_hex = env_or("ACI_WORKER_RUNTIME_SHA256", "");
     if sha256_hex.is_empty() {
         return Err("ACI_WORKER_RUNTIME_SHA256 is not set".to_string());
@@ -977,14 +1173,26 @@ async fn resolve_worker_runtime_at_startup() -> Result<PinnedWorkerRuntime, Stri
             Ok(value)
         }
     };
-    let grant = serde_json::json!({
-        "access_key_id": get_env("ACI_WORKER_RUNTIME_ACCESS_KEY_ID")?,
-        "secret_access_key": get_env("ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY")?,
+    let require_secret = |name: &str, value: &str| -> Result<String, String> {
+        if value.is_empty() {
+            Err(format!("{name} is not set"))
+        } else {
+            Ok(value.to_string())
+        }
+    };
+    let mut grant = serde_json::json!({
+        "access_key_id": require_secret(
+            "ACI_WORKER_RUNTIME_ACCESS_KEY_ID", &secrets.runtime_access_key_id)?,
+        "secret_access_key": require_secret(
+            "ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY", &secrets.runtime_secret_access_key)?,
         "bucket": get_env("ACI_WORKER_RUNTIME_BUCKET")?,
         "endpoint": get_env("ACI_WORKER_RUNTIME_ENDPOINT")?,
         "region": env_or("ACI_WORKER_RUNTIME_REGION", "auto"),
         "asset_prefix": env_or("ACI_WORKER_RUNTIME_ASSET_PREFIX", "v4/assets/"),
     });
+    if let Some(token) = &secrets.runtime_session_token {
+        grant["session_token"] = serde_json::Value::String(token.clone());
+    }
 
     let path = fetch_worker_bundle(&grant, &sha256_hex).await?;
     Ok(PinnedWorkerRuntime { path, sha256_hex: sha256_hex.to_ascii_lowercase() })
@@ -1045,21 +1253,7 @@ struct WorkerFailure<'a> {
 /// CPython/musl behavior -- worth confirming directly against a real
 /// ACI container before trusting it fully.
 async fn bwrap_self_test() -> bool {
-    match Command::new("timeout")
-        .arg("-s").arg("9")
-        .arg("-k").arg("2")
-        .arg("5")
-        .arg(BWRAP_BIN)
-        .arg("--unshare-all").arg("--share-net")
-        .arg("--die-with-parent")
-        .arg("--new-session")
-        .arg("--dev").arg("/dev")
-        .arg("--ro-bind").arg("/bin").arg("/bin")
-        .arg("--ro-bind").arg("/usr").arg("/usr")
-        .arg("--ro-bind").arg("/lib").arg("/lib")
-        .arg("--ro-bind").arg("/lib64").arg("/lib64")
-        .arg("--")
-        .arg("true")
+    match bwrap_self_test_command()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1117,10 +1311,36 @@ async fn bwrap_available() -> bool {
 /// own real HTTPS S3 calls, and the extracted worker_bundle directory
 /// itself (fetch_worker_bundle()'s own doc comment) for the interpreter,
 /// its dependencies, and worker.py/storage.py all together.
-/// `--share-net` (kept, not unshared, as part of `--unshare-all`): full
-/// outbound socket access, the same unrestricted network posture the
-/// sandlock-based version's `--net-allow '*'` gave -- fine-grained
-/// network ACLs are a well-scoped follow-up, not part of this swap.
+/// Environment: the worker gets a *cleared* environment plus the explicit
+/// WORKER_SANDBOX_ENV allowlist (PATH, HOME, PYTHONDONTWRITEBYTECODE) --
+/// `.env_clear()` on the spawned `timeout`/bwrap processes and
+/// `--clearenv` inside bwrap, so none of session_master's own variables
+/// (ACI_CALLBACK_TOKEN, ACI_CALLBACK_ADDR, ACI_GROUP_NAME, the
+/// ACI_WORKER_RUNTIME_* credential, ...) reach reviewer-submitted code.
+/// The secrets are additionally unset from this process's own
+/// environment at startup (BrokerSecrets::take_from_env()).
+///
+/// Network: `--share-net` (kept, not unshared, as part of
+/// `--unshare-all`): full outbound socket access, because storage.py makes
+/// real HTTPS S3 calls (to an endpoint that arrives in the per-request
+/// storage_grant) and worker.py dials this process's 127.0.0.1 queue
+/// listener (spawn_queue_listener()). That means worker code *can still
+/// open a TCP connection to ACI_CALLBACK_ADDR* (the broker's listener) --
+/// nothing in this sandbox filters egress. What does hold: the worker no
+/// longer knows ACI_CALLBACK_TOKEN (or the ACI_GROUP_NAME the shared-queue
+/// token is built from), so a connection it opens can't authenticate as
+/// this container; the broker must keep rejecting unauthenticated or
+/// replayed callback dials. No robust in-container filter exists on
+/// Confidential ACI: an owner-match iptables/nftables rule needs
+/// CAP_NET_ADMIN in the container's own netns (not granted), seccomp
+/// can't inspect `connect()`'s sockaddr, Landlock is absent from the
+/// host kernel (see the notes on BWRAP_BIN) and could only match ports
+/// anyway, and a private netns (`--unshare-net`) would cut off both S3
+/// and the loopback listener -- whose TCP address worker.py dials
+/// directly -- without a worker-python-runtime change plus an in-
+/// namespace relay. A network-level control (a subnet NSG denying
+/// worker-subnet -> broker, or broker-side single-use / source-bound
+/// tokens) is the right layer, not this process.
 /// `/tmp` is a fresh tmpfs and is explicitly mode 1777: worker code runs as
 /// uid 10001, so the tmpfs mount's root-owned default mode would otherwise
 /// prevent it from unpacking reviewer payloads there. `--dev` is freshly
@@ -1186,6 +1406,7 @@ async fn bwrap_available() -> bool {
 /// confirmed live to actually run on a real Confidential ACI container
 /// -- see that function's own doc comment. This function's fuller
 /// invocation (the extra `--ro-bind`s, `--tmpfs /tmp`, `--uid`/`--gid`,
+/// `--clearenv`/`--setenv` (also in the self-test, so that one does cover them),
 /// and running python3 rather than `true`) hasn't been separately
 /// confirmed yet, nor has either shape against Docker Desktop's own
 /// linuxkit VM target, nor whether worker.py's real workloads behave
@@ -1289,38 +1510,7 @@ async fn run_worker(request: &serde_json::Value, timeout: Duration) -> serde_jso
             "bubblewrap sandbox is unavailable on this host -- refusing to run the worker unsandboxed",
         );
     }
-    let mut command = {
-        let mut c = Command::new("timeout");
-        c.arg("-s").arg("9")
-            .arg("-k").arg("5")
-            .arg(timeout.as_secs().to_string())
-            .arg(BWRAP_BIN)
-            .arg("--unshare-all").arg("--share-net")
-            .arg("--die-with-parent")
-            .arg("--new-session")
-            .arg("--dev").arg("/dev")
-            .arg("--ro-bind").arg("/bin").arg("/bin")
-            .arg("--ro-bind").arg("/usr").arg("/usr")
-            .arg("--ro-bind").arg("/lib").arg("/lib")
-            .arg("--ro-bind").arg("/lib64").arg("/lib64")
-            .arg("--ro-bind").arg("/etc/ssl").arg("/etc/ssl")
-            .arg("--ro-bind").arg("/etc/resolv.conf").arg("/etc/resolv.conf")
-            .arg("--ro-bind").arg("/etc/hosts").arg("/etc/hosts")
-            .arg("--tmpfs").arg("/tmp")
-            .arg("--chmod").arg("1777").arg("/tmp")
-            .arg("--setenv").arg("PYTHONDONTWRITEBYTECODE").arg("1")
-            .arg("--uid").arg(worker_uid().to_string())
-            .arg("--gid").arg(worker_gid().to_string())
-            // The --ro-bind for the bundle dir must come after --tmpfs
-            // /tmp above, not before -- bwrap applies mount actions in
-            // argument order, and a bind targeting a path under /tmp
-            // issued before the fresh tmpfs is mounted there would just
-            // be shadowed by it.
-            .arg("--ro-bind").arg(&bundle).arg(&bundle)
-            .arg("--")
-            .arg(&entry_point);
-        c
-    };
+    let mut command = worker_sandbox_command(timeout, worker_uid(), worker_gid(), &bundle, &entry_point);
     let mut child = match command
         .kill_on_drop(true)
         .stdin(Stdio::piped())
@@ -1710,7 +1900,7 @@ async fn dial_callback(
         .ready()
         .await
         .map_err(|e| SessionError::Protocol(format!("h2 connection not ready: {e}")))?;
-    log::info!("dial_callback: h2 ready, sending callback request with token={token}");
+    log::info!("dial_callback: h2 ready, sending callback request");
     let (response, send) = ready
         .send_request(request, false)
         .map_err(|e| SessionError::Protocol(format!("could not send callback request: {e}")))?;
@@ -1882,12 +2072,13 @@ async fn run_one_dialed_session(
 }
 
 #[cfg(feature = "aci-attestation")]
-async fn aci_callback_handler() -> Result<(), SessionError> {
+async fn aci_callback_handler(token: &str) -> Result<(), SessionError> {
     let callback_addr = env_or("ACI_CALLBACK_ADDR", "");
     if callback_addr.is_empty() {
         return Err(SessionError::Protocol("ACI_CALLBACK_ADDR is not set".to_string()));
     }
-    let token = env_or("ACI_CALLBACK_TOKEN", "");
+    // Passed in from main()'s BrokerSecrets, not read from the
+    // environment -- see that type's own doc comment.
     if token.is_empty() {
         return Err(SessionError::Protocol("ACI_CALLBACK_TOKEN is not set".to_string()));
     }
@@ -1901,7 +2092,7 @@ async fn aci_callback_handler() -> Result<(), SessionError> {
     // gives up on the queue (see the loop below) -- not after every
     // individual job it happens to run first.
     let is_shared = is_shared_worker();
-    let (send, recv, connection_task) = dial_callback(&callback_addr, &token).await?;
+    let (send, recv, connection_task) = dial_callback(&callback_addr, token).await?;
     let session_result = run_one_dialed_session(send, recv, &callback_addr, None, !is_shared).await;
     log::info!("aci_callback_handler: first job returned {session_result:?}, waiting on connection driver");
     wait_for_connection_driver(connection_task).await;
@@ -1978,7 +2169,7 @@ async fn aci_callback_handler() -> Result<(), SessionError> {
 }
 
 #[cfg(feature = "aci-attestation")]
-async fn run_aci_callback_mode() {
+async fn run_aci_callback_mode(secrets: BrokerSecrets) {
     log::info!("session-master (aci-attestation build) starting");
 
     // Checked right after the build-variant line above (which CI greps
@@ -2000,7 +2191,7 @@ async fn run_aci_callback_mode() {
     // before ever presenting a token -- see resolve_worker_runtime_at_startup()'s
     // own doc comment.
     let resolved = WORKER_RUNTIME
-        .get_or_init(resolve_worker_runtime_at_startup)
+        .get_or_init(|| resolve_worker_runtime_at_startup(&secrets))
         .await;
     if let Err(e) = resolved {
         log::error!("could not resolve this container's own worker_bundle: {e}");
@@ -2008,18 +2199,24 @@ async fn run_aci_callback_mode() {
     }
     log::info!("worker_bundle resolved and extracted at startup");
 
-    if let Err(e) = aci_callback_handler().await {
+    if let Err(e) = aci_callback_handler(&secrets.callback_token).await {
         log::error!("aci session failed: {e}");
         std::process::exit(1);
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
+    // Strictly before the tokio runtime below (and so before any other
+    // thread exists): BrokerSecrets::take_from_env() unsets variables,
+    // which isn't thread-safe. Hence a hand-built runtime instead of
+    // `#[tokio::main]`, which would spin its worker threads up first.
+    let secrets = BrokerSecrets::take_from_env();
+    let runtime = tokio::runtime::Runtime::new().expect("could not build the tokio runtime");
+
     #[cfg(feature = "aci-attestation")]
-    run_aci_callback_mode().await;
+    runtime.block_on(run_aci_callback_mode(secrets));
     // Lambda mode (this binary built without --features aci-attestation)
     // has been removed entirely -- there is no other backend this binary
     // knows how to be anymore. Kept as a build target rather than making
@@ -2029,6 +2226,7 @@ async fn main() {
     // [dependencies] lines without a `cargo`-regenerated Cargo.lock.
     #[cfg(not(feature = "aci-attestation"))]
     {
+        let _ = (secrets, runtime);
         log::error!(
             "session_master was built without --features aci-attestation -- \
              Lambda mode has been removed; this binary only supports the ACI build now."
@@ -2117,7 +2315,9 @@ mod worker_bundle_tests {
     #[tokio::test]
     async fn startup_resolution_fails_closed_when_the_hash_env_var_is_unset() {
         std::env::remove_var("ACI_WORKER_RUNTIME_SHA256");
-        let err = resolve_worker_runtime_at_startup().await.unwrap_err();
+        let err = resolve_worker_runtime_at_startup(&super::BrokerSecrets::default())
+            .await
+            .unwrap_err();
         assert!(err.contains("ACI_WORKER_RUNTIME_SHA256 is not set"), "{err}");
     }
 
@@ -2151,5 +2351,122 @@ mod worker_bundle_tests {
         let pinned = "a".repeat(64);
         let request = serde_json::json!({});
         assert!(check_requested_worker_bundle_matches_pinned(&request, &pinned).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod sandbox_env_tests {
+    use super::{
+        bwrap_self_test_command, worker_sandbox_command, BrokerSecrets, WORKER_SANDBOX_ENV,
+    };
+    use std::time::Duration;
+
+    fn args_of(c: &tokio::process::Command) -> Vec<String> {
+        c.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    fn setenv_pairs(args: &[String]) -> Vec<(String, String)> {
+        args.windows(3)
+            .filter(|w| w[0] == "--setenv")
+            .map(|w| (w[1].clone(), w[2].clone()))
+            .collect()
+    }
+
+    fn worker_command() -> tokio::process::Command {
+        worker_sandbox_command(Duration::from_secs(30), 10001, 10001, "/tmp/b", "/tmp/b/runtime")
+    }
+
+    fn assert_clean(c: &tokio::process::Command) {
+        let args = args_of(c);
+        let clearenv = args.iter().position(|a| a == "--clearenv").expect("--clearenv missing");
+        let first_setenv = args.iter().position(|a| a == "--setenv").expect("no --setenv");
+        assert!(clearenv < first_setenv, "--clearenv must precede every --setenv: {args:?}");
+
+        let pairs = setenv_pairs(&args);
+        let expected: Vec<(String, String)> = WORKER_SANDBOX_ENV
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(pairs, expected);
+        assert!(pairs.iter().all(|(k, _)| !k.starts_with("ACI_")), "{pairs:?}");
+        assert!(!args.iter().any(|a| a.contains("ACI_")), "{args:?}");
+
+        // std's Debug for Command prints `env -i` when env_clear() was
+        // called -- the only way to observe it, there is no getter.
+        let dbg = format!("{:?}", c.as_std());
+        assert!(dbg.contains("env -i"), "env_clear() missing: {dbg}");
+        let envs: Vec<_> = c.as_std().get_envs().collect();
+        assert_eq!(envs.len(), 1, "wrapper should get only PATH: {envs:?}");
+        assert_eq!(envs[0].0, "PATH");
+    }
+
+    #[test]
+    fn worker_command_clears_the_environment() {
+        assert_clean(&worker_command());
+    }
+
+    #[test]
+    fn self_test_command_matches_the_worker_environment() {
+        assert_clean(&bwrap_self_test_command());
+    }
+
+    #[test]
+    fn allowlist_names_no_broker_variable() {
+        for (k, _) in WORKER_SANDBOX_ENV {
+            assert!(!k.starts_with("ACI_"), "{k}");
+        }
+    }
+
+    /// Runs the real wrapper with a poisoned parent environment and
+    /// checks `env` inside the sandbox prints exactly the allowlist.
+    /// Skipped where bwrap/user namespaces aren't usable.
+    #[tokio::test]
+    async fn sandboxed_env_shows_only_the_allowlist() {
+        if !super::bwrap_self_test().await {
+            eprintln!("skipping: bubblewrap unavailable here");
+            return;
+        }
+        std::env::set_var("ACI_CALLBACK_TOKEN", "leak-me");
+        std::env::set_var("ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY", "leak-me");
+        // /usr/bin/env directly as the entry point (--ro-bind /usr is in the command).
+        let out = worker_sandbox_command(Duration::from_secs(10), 10001, 10001, "/var/empty", "/usr/bin/env")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .expect("spawn");
+        std::env::remove_var("ACI_CALLBACK_TOKEN");
+        std::env::remove_var("ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() {
+            // e.g. the bundle path doesn't exist on this host; the
+            // command-shape tests above still cover the arguments.
+            eprintln!("skipping: sandbox run failed: {stderr}");
+            return;
+        }
+        // bwrap itself exports PWD for the child; not inherited from here.
+        let mut got: Vec<&str> = stdout.lines().filter(|l| !l.starts_with("PWD=")).collect();
+        got.sort();
+        let mut want: Vec<String> = WORKER_SANDBOX_ENV.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        want.sort();
+        assert_eq!(got, want, "stderr: {stderr}");
+    }
+
+    #[test]
+    fn broker_secrets_are_read_from_the_lookup_and_debug_is_redacted() {
+        let s = BrokerSecrets::from_lookup(|n| match n {
+            "ACI_CALLBACK_TOKEN" => Some("tok".into()),
+            "ACI_WORKER_RUNTIME_ACCESS_KEY_ID" => Some("akid".into()),
+            "ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY" => Some("sek".into()),
+            "ACI_WORKER_RUNTIME_SESSION_TOKEN" => Some("st".into()),
+            _ => None,
+        });
+        assert_eq!(s.callback_token, "tok");
+        assert_eq!(s.runtime_session_token.as_deref(), Some("st"));
+        let dbg = format!("{s:?}");
+        assert!(!dbg.contains("tok") && !dbg.contains("sek"), "{dbg}");
+
+        let none = BrokerSecrets::from_lookup(|n| (n == "ACI_WORKER_RUNTIME_SESSION_TOKEN").then(String::new));
+        assert_eq!(none.runtime_session_token, None, "empty session token = absent");
     }
 }
