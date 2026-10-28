@@ -111,6 +111,25 @@ jobs:
             exit 1
           fi
 
+      # The mock MAA token is compiled in only by `--features
+      # mock-attestation` (Cargo.toml), which aci/Dockerfile never passes.
+      # Extracts the real session_master from the built image and fails if
+      # that placeholder string is in it anyway -- a Dockerfile/feature
+      # regression there would otherwise ship a binary a deployment env var
+      # could turn into mock attestation. `docker create` + `docker cp` so
+      # the grep runs on the runner, not against whatever tools the image
+      # carries.
+      - name: Verify the image has no mock attestation compiled in
+        run: |
+          set -e
+          cid=$(docker create aci-session-worker:verify)
+          docker cp "$cid:/usr/local/bin/session_master" ./session_master.verify
+          docker rm "$cid" > /dev/null
+          if grep -q "mock-maa-token-no-real-attestation" ./session_master.verify; then
+            echo "::error::Built session_master contains the mock MAA token string -- it was compiled with --features mock-attestation. Refusing to push an image that could send mock attestation."
+            exit 1
+          fi
+
       # Tag by branch name, not a shared floating :dev: two branches (e.g. a
       # release dispatch and a main push) otherwise overwrite each other's
       # tag and a consumer silently gets whichever ran last. Docker tags

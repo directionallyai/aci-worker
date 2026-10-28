@@ -236,11 +236,42 @@ impl std::fmt::Debug for BrokerSecrets {
 /// runtime contract, not shared code, the same way the launched
 /// container's own env vars are a contract with aci_executor.rs's own
 /// launch() (that repo) without either side importing the other.
-fn mock_attestation_enabled() -> bool {
+///
+/// Only the env-var check itself, no mock token: it exists in every
+/// aci-attestation build so a build without the `mock-attestation` feature
+/// can still notice the variable being set and say it is ignored (see
+/// warn_if_mock_attestation_requested()).
+#[cfg(feature = "aci-attestation")]
+fn mock_attestation_env_set() -> bool {
     matches!(
         std::env::var("ATTESTER_MOCK_ATTESTATION").ok().as_deref(),
         Some("1") | Some("true") | Some("TRUE") | Some("True")
     )
+}
+
+/// Whether aci_callback_handler() should send MOCK_MAA_TOKEN instead of a
+/// real MAA token. Compiled only into a `--features mock-attestation`
+/// build (Cargo.toml's own comment on that feature): the release/Docker
+/// image has no such function, so ATTESTER_MOCK_ATTESTATION can never
+/// turn mock attestation on there, whatever the environment says.
+#[cfg(feature = "mock-attestation")]
+fn mock_attestation_enabled() -> bool {
+    mock_attestation_env_set()
+}
+
+/// In a build without `mock-attestation`, ATTESTER_MOCK_ATTESTATION is
+/// ignored -- logged loudly (once at startup, and again per handshake)
+/// rather than exiting, so a misconfigured deployment still attests for
+/// real instead of failing the session. Compiled to nothing when the mock
+/// path is built in.
+#[cfg(all(feature = "aci-attestation", not(feature = "mock-attestation")))]
+fn warn_if_mock_attestation_requested() {
+    if mock_attestation_env_set() {
+        log::error!(
+            "ATTESTER_MOCK_ATTESTATION is set but ignored: this binary was built \
+             without the `mock-attestation` feature, so it always does real attestation"
+        );
+    }
 }
 
 /// A bare hostname (e.g. `sharedeus.eus.attest.azure.net`), NOT a full
@@ -279,7 +310,11 @@ fn worker_timeout() -> Duration {
 /// strength of this string alone (a client sending this same bytes could
 /// never reach that function directly -- attested_session.rs's own ACI
 /// branch is what calls verify_maa_token(), never the client).
-#[cfg(feature = "aci-attestation")]
+///
+/// Only compiled into a `--features mock-attestation` build: the
+/// release/Docker image does not contain this string at all (the
+/// aci-session-worker-build workflow greps the built binary for it).
+#[cfg(feature = "mock-attestation")]
 const MOCK_MAA_TOKEN: &str = "mock-maa-token-no-real-attestation";
 
 /// How long, in seconds, run_callback_session() sleeps just before
@@ -1981,8 +2016,11 @@ async fn aci_handshake(
     // requested and no options resolved are the same claim either way.
     let options = hello.get("options").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    // ATTESTER_MOCK_ATTESTATION: same flag, same "never in production, an
-    // empty/placeholder document is not attestation evidence" posture
+    // ATTESTER_MOCK_ATTESTATION (only honored in a `--features
+    // mock-attestation` build -- anywhere else it is ignored and a real
+    // MAA token is always fetched below): same flag, same "never in
+    // production, an empty/placeholder document is not attestation
+    // evidence" posture
     // attestation.rs's own Nitro/Azure-guest mock mode already documents
     // -- mirrored here rather than reused directly since this build has
     // no real SEV-SNP/MAA hardware to fall back to on a host that isn't
@@ -1996,10 +2034,18 @@ async fn aci_handshake(
     // launch() is what actually propagates this flag into the launched
     // container's env in the first place -- this process never reads it
     // from anywhere else.
+    #[cfg(feature = "mock-attestation")]
     let maa_token = if mock_attestation_enabled() {
         log::warn!("aci_callback_handler: ATTESTER_MOCK_ATTESTATION set -- skipping real MAA attestation");
         MOCK_MAA_TOKEN.to_string()
     } else {
+        log::info!("aci_callback_handler: getting a real MAA token");
+        let http_client = reqwest::Client::new();
+        aci_attestation::get_maa_token(&http_client, &client_public_key_hash, &options).await?
+    };
+    #[cfg(not(feature = "mock-attestation"))]
+    let maa_token = {
+        warn_if_mock_attestation_requested();
         log::info!("aci_callback_handler: getting a real MAA token");
         let http_client = reqwest::Client::new();
         aci_attestation::get_maa_token(&http_client, &client_public_key_hash, &options).await?
@@ -2171,6 +2217,8 @@ async fn aci_callback_handler(token: &str) -> Result<(), SessionError> {
 #[cfg(feature = "aci-attestation")]
 async fn run_aci_callback_mode(secrets: BrokerSecrets) {
     log::info!("session-master (aci-attestation build) starting");
+    #[cfg(not(feature = "mock-attestation"))]
+    warn_if_mock_attestation_requested();
 
     // Checked right after the build-variant line above (which CI greps
     // for) so a host without a working sandbox still identifies its build,
