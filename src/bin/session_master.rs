@@ -85,7 +85,9 @@
 //!   7. derive the session key via session_protocol::derive_session_key()
 //!   8. read one AES-256-GCM frame (AAD "client-to-server"), decrypt ->
 //!      {mode, code, storage_grant, pattern_delegate}
-//!   9. run_worker(): fetch_worker_bundle() resolves and verifies a
+//!   9. run_worker(): fetch_worker_bundle() fetches (with the request's
+//!      own storage_grant), verifies against the broker-pinned
+//!      ACI_WORKER_RUNTIME_SHA256, and caches a
 //!      content-hash-pinned tarball from CAS -- a self-contained Python
 //!      runtime (interpreter, its own dependencies, worker.py/storage.py
 //!      themselves, all published from worker-python-runtime, a
@@ -166,9 +168,12 @@ fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
-/// The broker-forwarded secrets this process needs for its own work
-/// (dialing the callback listener, fetching the worker bundle) -- and
-/// that must never be visible to the worker it spawns.
+/// The broker-forwarded secret this process needs for its own work
+/// (dialing the callback listener) -- and that must never be visible to
+/// the worker it spawns. The ACI_WORKER_RUNTIME_* credential names are
+/// still scrubbed, not read: an older broker forwards them, and the
+/// bundle is now fetched with the request's own storage_grant instead
+/// (DIR-492, run_worker()).
 ///
 /// take_from_env() moves them out of the process environment into owned
 /// values and unsets the variables, so nothing spawned later (even by
@@ -180,18 +185,13 @@ fn env_or(name: &str, default: &str) -> String {
 /// What this does not do: Linux keeps the *initial* environment block
 /// readable at /proc/<pid>/environ regardless of later unsetenv, and the
 /// values still live in this process's memory (they have to -- they're
-/// used for the dial and the S3 fetch). The sandboxed worker can't reach
+/// used for the dial). The sandboxed worker can't reach
 /// either (separate pid namespace, no /proc mounted, different uid), so
 /// this is defense in depth for child-process inheritance, not a
 /// guarantee against a compromised session_master itself.
 #[derive(Default)]
 struct BrokerSecrets {
     callback_token: String,
-    runtime_access_key_id: String,
-    runtime_secret_access_key: String,
-    /// ACI_WORKER_RUNTIME_SESSION_TOKEN: only present when the broker
-    /// injects a short-lived per-launch credential.
-    runtime_session_token: Option<String>,
 }
 
 impl BrokerSecrets {
@@ -214,9 +214,6 @@ impl BrokerSecrets {
     fn from_lookup(mut get: impl FnMut(&str) -> Option<String>) -> Self {
         BrokerSecrets {
             callback_token: get("ACI_CALLBACK_TOKEN").unwrap_or_default(),
-            runtime_access_key_id: get("ACI_WORKER_RUNTIME_ACCESS_KEY_ID").unwrap_or_default(),
-            runtime_secret_access_key: get("ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY").unwrap_or_default(),
-            runtime_session_token: get("ACI_WORKER_RUNTIME_SESSION_TOKEN").filter(|t| !t.is_empty()),
         }
     }
 }
@@ -1147,90 +1144,51 @@ async fn fetch_worker_bundle(
     Ok(extract_dir.join("runtime"))
 }
 
-/// The runtime this container is restricted to -- resolved once, at
+/// The runtime this container is restricted to -- pinned once, at
 /// startup, before this process ever dials the callback listener (see
-/// resolve_worker_runtime_at_startup(), main()'s own caller). Holds both
-/// the extracted path and the hash it was resolved from: run_worker()
-/// needs the hash too, to reject a request that names a *different*
-/// worker_bundle than this container was actually launched to run.
+/// resolve_worker_runtime_at_startup(), main()'s own caller). Only the
+/// hash: the bundle itself is fetched on the first request, with that
+/// request's own storage_grant (run_worker()), and cached on disk for
+/// any later job a shared worker serves.
 #[derive(Debug)]
 struct PinnedWorkerRuntime {
-    path: std::path::PathBuf,
     sha256_hex: String,
 }
 
 static WORKER_RUNTIME: tokio::sync::OnceCell<Result<PinnedWorkerRuntime, String>> =
     tokio::sync::OnceCell::const_new();
 
-/// Fetches and extracts this container's one worker_bundle before any
-/// callback dial-out, from `ACI_WORKER_RUNTIME_SHA256` and a dedicated,
-/// read-only-on-v4/assets/ credential the broker injects the same way it
-/// already injects ACI_CALLBACK_ADDR/_TOKEN (aci_executor.rs's own
-/// create_group_body(), attested-python-execution repo) -- deliberately
-/// NOT the per-request `storage_grant` a client's own encrypted request
-/// carries, which doesn't exist yet at this point in startup and
-/// wouldn't be this container's own call to trust anyway (see
-/// run_worker()'s own doc comment on why the request's own worker_bundle
-/// field is now only ever checked against this value, never used to
-/// select a fetch itself).
+/// Pins this container's one worker_bundle hash from
+/// `ACI_WORKER_RUNTIME_SHA256`, set by the broker the same way it sets
+/// ACI_CALLBACK_ADDR/_TOKEN (aci_executor.rs's own create_group_body(),
+/// attested-python-execution repo). Restriction and fetch are separate
+/// concerns (DIR-492): the broker decides *which* bundle may run, and a
+/// request can only confirm it (check_requested_worker_bundle_matches_pinned());
+/// the bytes are fetched later with the request's own storage_grant,
+/// which can already read v4/assets/, and verified against this hash.
+/// The credential only decides whether the fetch succeeds, never what
+/// runs, so the broker no longer has to hold or forward a storage key.
 ///
-/// Both this hash and this credential are deliberately left as
-/// unresolved parameters in aci/arm-template-dev.json's own throwaway
-/// CCE-policy-generation template (same treatment as ACI_CALLBACK_ADDR/
-/// _TOKEN) -- "not CCE locked": which worker_bundle a fleet runs can
-/// change (a new worker-python-runtime release) without a CCE policy
-/// regeneration, the same property moving worker.py/storage.py out of
-/// this image's own build already bought for application-code changes.
+/// The hash is deliberately left as an unresolved parameter in
+/// aci/arm-template-dev.json's own throwaway CCE-policy-generation
+/// template (same treatment as ACI_CALLBACK_ADDR/_TOKEN) -- "not CCE
+/// locked": which worker_bundle a fleet runs can change (a new
+/// worker-python-runtime release) without a CCE policy regeneration.
 ///
-/// The credential comes from `secrets` (BrokerSecrets::take_from_env(),
-/// read and scrubbed from the process environment before any thread
-/// starts), not from `std::env` -- see that type's own doc comment. The
-/// optional ACI_WORKER_RUNTIME_SESSION_TOKEN rides along in the same
-/// struct for a short-lived (STS-style) credential.
-///
-/// Failing here is fatal, not a per-request error: a container that
-/// cannot resolve its own restricted runtime has nothing it could ever
-/// legitimately run, so main()'s own caller exits the process outright
-/// rather than dialing back with nothing to offer.
-async fn resolve_worker_runtime_at_startup(
-    secrets: &BrokerSecrets,
-) -> Result<PinnedWorkerRuntime, String> {
+/// Failing here is fatal, not a per-request error: a container with no
+/// valid pin has nothing it could ever legitimately run, so main()'s own
+/// caller exits the process outright rather than dialing back.
+async fn resolve_worker_runtime_at_startup() -> Result<PinnedWorkerRuntime, String> {
     let sha256_hex = env_or("ACI_WORKER_RUNTIME_SHA256", "");
     if sha256_hex.is_empty() {
         return Err("ACI_WORKER_RUNTIME_SHA256 is not set".to_string());
     }
-
-    let get_env = |name: &str| -> Result<String, String> {
-        let value = env_or(name, "");
-        if value.is_empty() {
-            Err(format!("{name} is not set"))
-        } else {
-            Ok(value)
-        }
-    };
-    let require_secret = |name: &str, value: &str| -> Result<String, String> {
-        if value.is_empty() {
-            Err(format!("{name} is not set"))
-        } else {
-            Ok(value.to_string())
-        }
-    };
-    let mut grant = serde_json::json!({
-        "access_key_id": require_secret(
-            "ACI_WORKER_RUNTIME_ACCESS_KEY_ID", &secrets.runtime_access_key_id)?,
-        "secret_access_key": require_secret(
-            "ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY", &secrets.runtime_secret_access_key)?,
-        "bucket": get_env("ACI_WORKER_RUNTIME_BUCKET")?,
-        "endpoint": get_env("ACI_WORKER_RUNTIME_ENDPOINT")?,
-        "region": env_or("ACI_WORKER_RUNTIME_REGION", "auto"),
-        "asset_prefix": env_or("ACI_WORKER_RUNTIME_ASSET_PREFIX", "v4/assets/"),
-    });
-    if let Some(token) = &secrets.runtime_session_token {
-        grant["session_token"] = serde_json::Value::String(token.clone());
+    if sha256_hex.len() != 64 || !sha256_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("invalid ACI_WORKER_RUNTIME_SHA256: {sha256_hex:?}"));
     }
-
-    let path = fetch_worker_bundle(&grant, &sha256_hex).await?;
-    Ok(PinnedWorkerRuntime { path, sha256_hex: sha256_hex.to_ascii_lowercase() })
+    Ok(PinnedWorkerRuntime {
+        sha256_hex: sha256_hex.to_ascii_lowercase(),
+    })
 }
 
 #[derive(serde::Serialize)]
@@ -1483,16 +1441,14 @@ async fn run_worker(request: &serde_json::Value, timeout: Duration) -> serde_jso
         Err(e) => return worker_failure(&format!("could not serialize request: {e}")),
     };
 
-    // This container's worker_bundle was already fetched, verified, and
-    // extracted at startup (resolve_worker_runtime_at_startup(), before
-    // this process ever dialed the callback listener) -- run_worker()
-    // itself no longer fetches anything, and no longer trusts a
-    // per-request storage_grant to do so. A request's own `worker_bundle`
-    // field, if present, is only ever checked against this container's
-    // own pinned hash and refused on mismatch -- it can no longer select
-    // *which* bundle runs, only confirm the caller and this container
-    // agree on it. Omitting the field entirely is fine: there is only
-    // ever one bundle this container can run regardless.
+    // This container's worker_bundle hash was pinned at startup
+    // (resolve_worker_runtime_at_startup(), before this process ever
+    // dialed the callback listener). A request's own `worker_bundle`
+    // field, if present, is only ever checked against that pin and
+    // refused on mismatch -- it can no longer select *which* bundle runs,
+    // only confirm the caller and this container agree on it. Omitting
+    // the field entirely is fine: there is only ever one bundle this
+    // container can run regardless.
     let pinned = match WORKER_RUNTIME.get() {
         Some(Ok(pinned)) => pinned,
         Some(Err(e)) => {
@@ -1509,7 +1465,18 @@ async fn run_worker(request: &serde_json::Value, timeout: Duration) -> serde_jso
     if let Err(e) = check_requested_worker_bundle_matches_pinned(request, &pinned.sha256_hex) {
         return worker_failure(&e);
     }
-    let worker_bundle_path = pinned.path.clone();
+    // Fetched with the request's own storage_grant -- always the pinned
+    // hash, never the request's, and verified against it byte for byte
+    // (fetch_worker_bundle()). A cache hit for every job after the first
+    // one a shared worker serves, so the grant is only used once per
+    // container.
+    let grant = request
+        .get("storage_grant")
+        .unwrap_or(&serde_json::Value::Null);
+    let worker_bundle_path = match fetch_worker_bundle(grant, &pinned.sha256_hex).await {
+        Ok(path) => path,
+        Err(e) => return worker_failure(&format!("could not fetch worker_bundle: {e}")),
+    };
 
     // kill_on_drop: without this, dropping `child` (which is exactly what
     // happens below when our own tokio::time::timeout fires and abandons
@@ -2233,19 +2200,18 @@ async fn run_aci_callback_mode(secrets: BrokerSecrets) {
         std::process::exit(1);
     }
 
-    // Resolved before dialing the callback listener at all: a container
-    // that can't fetch/verify its own restricted worker_bundle has
-    // nothing it could legitimately run, so this fails the whole process
-    // before ever presenting a token -- see resolve_worker_runtime_at_startup()'s
-    // own doc comment.
+    // Pinned before dialing the callback listener at all: a container
+    // with no valid worker_bundle pin has nothing it could legitimately
+    // run, so this fails the whole process before ever presenting a
+    // token -- see resolve_worker_runtime_at_startup()'s own doc comment.
     let resolved = WORKER_RUNTIME
-        .get_or_init(|| resolve_worker_runtime_at_startup(&secrets))
+        .get_or_init(resolve_worker_runtime_at_startup)
         .await;
     if let Err(e) = resolved {
-        log::error!("could not resolve this container's own worker_bundle: {e}");
+        log::error!("could not pin this container's own worker_bundle: {e}");
         std::process::exit(1);
     }
-    log::info!("worker_bundle resolved and extracted at startup");
+    log::info!("worker_bundle pinned at startup; fetched on the first request");
 
     if let Err(e) = aci_callback_handler(&secrets.callback_token).await {
         log::error!("aci session failed: {e}");
@@ -2363,9 +2329,7 @@ mod worker_bundle_tests {
     #[tokio::test]
     async fn startup_resolution_fails_closed_when_the_hash_env_var_is_unset() {
         std::env::remove_var("ACI_WORKER_RUNTIME_SHA256");
-        let err = resolve_worker_runtime_at_startup(&super::BrokerSecrets::default())
-            .await
-            .unwrap_err();
+        let err = resolve_worker_runtime_at_startup().await.unwrap_err();
         assert!(err.contains("ACI_WORKER_RUNTIME_SHA256 is not set"), "{err}");
     }
 
@@ -2510,11 +2474,18 @@ mod sandbox_env_tests {
             _ => None,
         });
         assert_eq!(s.callback_token, "tok");
-        assert_eq!(s.runtime_session_token.as_deref(), Some("st"));
         let dbg = format!("{s:?}");
         assert!(!dbg.contains("tok") && !dbg.contains("sek"), "{dbg}");
+    }
 
-        let none = BrokerSecrets::from_lookup(|n| (n == "ACI_WORKER_RUNTIME_SESSION_TOKEN").then(String::new));
-        assert_eq!(none.runtime_session_token, None, "empty session token = absent");
+    #[test]
+    fn legacy_runtime_credential_names_are_still_scrubbed() {
+        for name in [
+            "ACI_WORKER_RUNTIME_ACCESS_KEY_ID",
+            "ACI_WORKER_RUNTIME_SECRET_ACCESS_KEY",
+            "ACI_WORKER_RUNTIME_SESSION_TOKEN",
+        ] {
+            assert!(BrokerSecrets::ENV_NAMES.contains(&name), "{name}");
+        }
     }
 }
