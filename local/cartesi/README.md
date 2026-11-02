@@ -75,17 +75,30 @@ is replaced with the current Unix time at start so the guest clock is right (a g
 every TLS handshake with "certificate is not yet valid"). Guest console goes to stdout; SIGINT/SIGTERM stop
 it between slices of 2^27 cycles (exit 130); a halt exits with the guest's own code.
 
-Built against the dynamic library it boots the worker and serves real world requests. A fully static
-executable (`STATIC=1 runner/build-runner.sh`) does not link yet because Debian's `-dev` packages ship no
-static `libslirp` or `glib-2.0`; the emulator's own archive, libstdc++, libgomp, libatomic and glibc all
-resolve statically. The emulator uses neither library directly: it calls libslirp from one file
-(`src/virtio-net-user-address-range.cpp`, the user-mode network behind `-n`/`-p`), libslirp imports 28 glib
-functions (memory, strings, random numbers, logging, and process spawning for a guest-forward-to-command
-feature we do not use), and glib's only user of pcre2 is its regular-expression support, which libslirp does
-not use. So a static build should need `libslirp.a` and `libglib-2.0.a` but, untested, not pcre2 (a static
-link only pulls in the parts of `libglib.a` that are referenced). Alpine ships a static glib; libslirp would
-be built from source (meson, static, it needs only glib). TAP networking (`--virtio-net=<iface>`) needs
-neither, but needs root and a bridge on the host.
+Built against the dynamic library it boots the worker and serves real world requests (`runner/build-runner.sh`).
+`runner/build-static.sh` builds the same program as a **fully static executable** (45 MB with debug
+information, 9.9 MB stripped; `file` says "statically linked", `ldd` "not a dynamic executable"), and the
+machine boots and serves real world requests from it inside a bare `busybox` container, which has no glibc,
+glib, libslirp or libstdc++. What it takes, checked against Debian trixie:
+
+- The emulator uses neither glib nor pcre2 directly. It calls libslirp from one file
+  (`src/virtio-net-user-address-range.cpp`, the user-mode network behind `-n`/`-p`); libslirp imports 28 glib
+  functions (memory, strings, random numbers, logging, and process spawning for a guest-forward-to-command
+  feature we do not use); glib's only user of pcre2 is its regular-expression support.
+- Static glib, pcre2, libffi, zlib and sysprof-capture all ship in Debian: `libglib-2.0.a` comes from
+  `libgio-2.0-dev` (which `libglib2.0-dev` depends on, so listing `libglib2.0-dev` alone shows nothing),
+  the others from `libpcre2-dev`, `libffi-dev`, `zlib1g-dev` and `libsysprof-capture-4-dev`.
+- **libslirp is the only missing static library**: `libslirp-dev` (4.8.0) ships headers, `slirp.pc` and the
+  `.so` symlink, and no package in the trixie archive contains a `libslirp*.a`. `build-static.sh` builds it from
+  source (meson, static, same 4.8.0 that `libcartesi.a` was compiled against).
+- Static glibc warns that `dlopen` (libgomp's offload plugin loader) and the user-database lookups in glib
+  (`getpwnam_r`, `getpwuid`) need the matching shared glibc at run time; neither is used here.
+- Speed: interleaved with the dynamic build (same grant, two rounds, six world requests each) the world
+  requests are the same within noise (warm median 4.47 s static, 4.85 s dynamic; ready 8.6 s and 8.3 s);
+  worldless requests are consistently about 10 ms slower (58 ms against 48 ms).
+
+TAP networking (`--virtio-net=<iface>`) would avoid glib and libslirp altogether, but needs root and a
+bridge on the host.
 
 ## The world-code cache
 
@@ -106,7 +119,7 @@ aci-worker starts a fresh sandboxed process per request and keeps `worker.py` pi
 | Boot to listening / warm worker ready | about 5 s / about 9 s |
 | Worldless request, warm | 0.04-0.06 s |
 | World request, no cache | about 10 s |
-| World request, with cache (steady state) | about 5.4 s via the Lua command line, about 4 s via the C runner (unexplained; single runs) |
+| World request, with cache (steady state) | about 4-5.4 s. Runs on different occasions differ by up to a second because Tigris latency varies; an interleaved dynamic-vs-static runner test showed no difference beyond noise. Whether the C runner beats the Lua command line was not tested in an interleaved run, so treat the earlier 4 s against 5.4 s as unproven. |
 | Python imports of worker+storage+cryptography (uv runtime) | about 3 s (Ubuntu's Python: 4.6 s) |
 | `compile()` of `world_core.py` (68 KB) in the guest | 0.6 s |
 
@@ -164,6 +177,17 @@ itself is plain data in the machine configuration.
 - **Not reproducible or attestable like the x86_64 runtime**: the interpreter is 3.12.16 (the repo pins
   3.12.14), `.pyc` files are kept, and the two cross-built wheels are not hash-pinned. They statically link
   Ubuntu noble's OpenSSL 3.0.x, not the newer OpenSSL the official wheels bundle.
+- **The static build is not reproducible yet, and should move to a reproducible Ubuntu snapshot Docker
+  environment.** `build-static.sh` runs in the emulator's Debian trixie builder image and does a live
+  `apt-get update && install` (meson, ninja, glib, pcre2, libffi, zlib, sysprof-capture) at build time, then
+  fetches the libslirp tarball by tag with no checksum, so two builds on different days can differ. The
+  riscv64 builds of `cffi` and `cryptography` and the root-image scripts have the same shape (an
+  `ubuntu:24.04` tag, live apt, packages from `ports.ubuntu.com`). The pattern to follow is already in the
+  reviewer-agent and worker-python-runtime Dockerfiles: a digest-pinned base image, apt pointed at a dated
+  `snapshot.ubuntu.com`, tools fetched with a pinned version and sha256. Ideally the emulator itself
+  (`libcartesi.a`) is built in that same environment, so the static glibc, glib and libslirp all come from one
+  snapshot, and Ubuntu 24.04 matches the guest's userland. The erofs image already builds to the same sha256
+  twice from the same inputs; the static executable should too.
 - **Not done**: a write test through this worker, supervision to restart the warm process, TLS session
-  resumption, a static executable, DAX for the erofs root, and an arm64/macOS/Windows check (TAP is
-  Linux-only; no macOS or Windows CI upstream).
+  resumption, DAX for the erofs root, an interleaved C-runner-versus-Lua-CLI timing, and an
+  arm64/macOS/Windows check (TAP is Linux-only; no macOS or Windows CI upstream).
