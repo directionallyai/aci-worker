@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds run-cartesi-worker natively on the machine it runs on (Windows under MSYS2/MINGW64, or macOS), from the
+# Builds run-cartesi-worker natively on the machine it runs on (Windows under MSYS2/UCRT64, or macOS), from the
 # emulator's own sources: libcartesi.a with the emulator's Makefile, then the C runner linked against it.
 # Used by .github/workflows/cartesi-runner-native.yml. UNATTESTED, DEV ONLY (virtio-net via libslirp).
 #
@@ -13,7 +13,8 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 TAG="${EMULATOR_TAG:-v0.22.0}"
 OS="$(uname -s)"
 case "$OS" in
-  Darwin) THREADS="${THREADS:-no}"; EXT=""; JOBS="$(sysctl -n hw.ncpu)" ;;
+  Darwin) THREADS="${THREADS:-no}"; export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"; # the Makefile would use the runner's own OS version
+          EXT=""; JOBS="$(sysctl -n hw.ncpu)" ;;
   MINGW*|MSYS*) THREADS="${THREADS:-yes}"; EXT=".exe"; JOBS="$(nproc)" ;;
   *) echo "unsupported host $OS (Linux uses build-static.sh)"; exit 2 ;;
 esac
@@ -61,5 +62,5 @@ strip "$OUT/run-cartesi-worker$EXT" 2>/dev/null || true
 {
   echo "host: $OS $(uname -m)   emulator: $TAG   threads: $THREADS   flash executable: ${FLASH_X:-no}"
   ls -la "$OUT/run-cartesi-worker$EXT"
-  if [ "$OS" = Darwin ]; then otool -L "$OUT/run-cartesi-worker"; else ldd "$OUT/run-cartesi-worker.exe" 2>/dev/null || true; fi
+  if [ "$OS" = Darwin ]; then otool -l "$OUT/run-cartesi-worker" | grep -A4 LC_BUILD_VERSION; otool -L "$OUT/run-cartesi-worker"; else ldd "$OUT/run-cartesi-worker.exe" 2>/dev/null || true; fi
 } | tee "$OUT/report.txt"
