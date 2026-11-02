@@ -6,7 +6,7 @@
 # usage: build-native.sh OUTDIR
 #   OUTDIR     receives run-cartesi-worker[.exe] and a short report
 # env: EMULATOR_TAG (default v0.22.0), FLASH_X=yes to also make the flash drive executable (needed for a DAX root;
-#      see local/cartesi/README.md), THREADS (default yes on Windows, no on macOS: no libomp to bundle)
+#      see local/cartesi/README.md), THREADS (default no: OpenMP only speeds up hashing, and MSYS2 has no static libgomp nor macOS a libomp to bundle)
 set -eu
 OUT="$1"; mkdir -p "$OUT"; OUT="$(cd "$OUT" && pwd)"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -15,7 +15,7 @@ OS="$(uname -s)"
 case "$OS" in
   Darwin) THREADS="${THREADS:-no}"; export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"; # the Makefile would use the runner's own OS version
           EXT=""; JOBS="$(sysctl -n hw.ncpu)" ;;
-  MINGW*|MSYS*) THREADS="${THREADS:-yes}"; EXT=".exe"; JOBS="$(nproc)" ;;
+  MINGW*|MSYS*) THREADS="${THREADS:-no}"; EXT=".exe"; JOBS="$(nproc)" ;;
   *) echo "unsupported host $OS (Linux uses build-static.sh)"; exit 2 ;;
 esac
 
@@ -62,8 +62,9 @@ case "$OS" in
     clang++ -O2 -x c -I"$S" -I"$PFX/include" "$HERE/run-cartesi-worker.c" -x none -o "$OUT/run-cartesi-worker" \
       "$S/libcartesi.a" $LIBS -lc++ -framework CoreFoundation -framework Foundation -liconv -lresolv ;;
   *)
+    OMP=""; [ "$THREADS" = yes ] && OMP="-fopenmp"
     g++ -O2 -x c -I"$S" "$HERE/run-cartesi-worker.c" -x none -o "$OUT/run-cartesi-worker.exe" \
-      "$S/libcartesi.a" $(pkg-config --static --libs slirp) -static -fopenmp -lws2_32 -liphlpapi ;;
+      "$S/libcartesi.a" $(pkg-config --static --libs slirp) -static $OMP -lws2_32 -liphlpapi ;;
 esac
 strip "$OUT/run-cartesi-worker$EXT" 2>/dev/null || true
 {
