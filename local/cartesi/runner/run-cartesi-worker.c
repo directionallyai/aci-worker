@@ -124,11 +124,16 @@ int main(int argc, char **argv) {
         (unsigned long long)(version / 1000000), (unsigned long long)((version / 1000) % 1000),
         (unsigned long long)(version % 1000));
 
+#ifdef _WIN32 /* no sigaction; signal() covers Ctrl-C (SIGINT) and SIGTERM */
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+#else
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_signal;
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
+#endif
 
     int status = 0;
     for (;;) {

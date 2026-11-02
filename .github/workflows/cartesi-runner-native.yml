@@ -1,0 +1,79 @@
+name: Cartesi runner (Windows, macOS)
+
+# Builds local/cartesi/runner/run-cartesi-worker (UNATTESTED, DEV ONLY) on native runners: the emulator's own
+# Makefile builds libcartesi.a, then the C runner is linked against it. Manual only (workflow_dispatch).
+# The microarchitecture's pristine RAM and hash files need the riscv64 toolchain, so they are generated once
+# on Linux (docker image cartesi/machine-emulator:toolchain) and handed to the other jobs as an artifact.
+#
+# UNTESTED: written without access to Windows or macOS machines; expect to iterate on the first runs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      emulator_tag:
+        description: cartesi/machine-emulator tag
+        default: v0.22.0
+      flash_x:
+        description: make the flash drive executable (needed for a DAX root; experiment)
+        default: 'no'
+
+permissions:
+  contents: read
+
+jobs:
+  uarch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate the pristine uarch files
+        run: |
+          git clone -q --depth 1 --branch "${{ inputs.emulator_tag }}" https://github.com/cartesi/machine-emulator.git emu
+          cd emu
+          git submodule update --init --depth 1 || true
+          make -C src cm-version.h interpret-jump-table.hpp
+          make uarch-with-toolchain
+          mkdir -p ../uarch-out && cp uarch/uarch-pristine-ram.c uarch/uarch-pristine-hash.c ../uarch-out/
+          sha256sum ../uarch-out/*
+      - uses: actions/upload-artifact@v4
+        with: { name: uarch-pristine, path: uarch-out }
+
+  windows-x86_64:
+    needs: uarch
+    runs-on: windows-2022
+    defaults: { run: { shell: 'msys2 {0}' } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git make mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf mingw-w64-x86_64-boost
+            mingw-w64-x86_64-libslirp mingw-w64-x86_64-glib2 mingw-w64-x86_64-lua
+      - uses: actions/download-artifact@v4
+        with: { name: uarch-pristine, path: uarch-in }
+      - name: Build
+        env: { FLASH_X: '${{ inputs.flash_x }}', EMULATOR_TAG: '${{ inputs.emulator_tag }}' }
+        run: sh local/cartesi/runner/ci/build-native.sh uarch-in out
+      - uses: actions/upload-artifact@v4
+        with: { name: run-cartesi-worker-windows-x86_64, path: out }
+
+  macos:
+    needs: uarch
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14, arch: arm64 }
+          - { runner: macos-15-intel, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install boost libslirp glib pkgconf lua@5.4
+      - uses: actions/download-artifact@v4
+        with: { name: uarch-pristine, path: uarch-in }
+      - name: Build
+        env: { FLASH_X: '${{ inputs.flash_x }}', EMULATOR_TAG: '${{ inputs.emulator_tag }}' }
+        run: sh local/cartesi/runner/ci/build-native.sh uarch-in out
+      - uses: actions/upload-artifact@v4
+        with: { name: 'run-cartesi-worker-macos-${{ matrix.arch }}', path: out }
