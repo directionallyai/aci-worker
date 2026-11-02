@@ -58,7 +58,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: uarch-pristine, path: uarch-in }
       - name: Build
-        env: { FLASH_X: '${{ inputs.flash_x || 'no' }}', EMULATOR_TAG: '${{ inputs.emulator_tag || 'v0.22.0' }}' }
+        env:
+          FLASH_X: ${{ inputs.flash_x || 'no' }}
+          EMULATOR_TAG: ${{ inputs.emulator_tag || 'v0.22.0' }}
         run: sh local/cartesi/runner/ci/build-native.sh uarch-in out
       - uses: actions/upload-artifact@v4
         with: { name: run-cartesi-worker-windows-x86_64, path: out }
@@ -78,7 +80,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: uarch-pristine, path: uarch-in }
       - name: Build
-        env: { FLASH_X: '${{ inputs.flash_x || 'no' }}', EMULATOR_TAG: '${{ inputs.emulator_tag || 'v0.22.0' }}' }
+        env:
+          FLASH_X: ${{ inputs.flash_x || 'no' }}
+          EMULATOR_TAG: ${{ inputs.emulator_tag || 'v0.22.0' }}
         run: sh local/cartesi/runner/ci/build-native.sh uarch-in out
       - uses: actions/upload-artifact@v4
         with: { name: 'run-cartesi-worker-macos-${{ matrix.arch }}', path: out }
