@@ -28,6 +28,13 @@ printf '#include <stddef.h>\nunsigned char uarch_pristine_ram[] = {0};\nunsigned
 printf 'const unsigned char uarch_pristine_hash[32] = {0};\nconst unsigned int uarch_pristine_hash_len = 32;\n' > uarch/uarch-pristine-hash.c
 # The emulator generates interpret-jump-table.hpp with a script whose shebang is `lua5.4`.
 command -v lua5.4 >/dev/null 2>&1 || { l="$(command -v lua)"; mkdir -p "$W/bin"; ln -s "$l" "$W/bin/lua5.4"; export PATH="$W/bin:$PATH"; }
+# Windows: upstream's slirp network device includes POSIX-only headers (arpa/inet.h, sys/select.h) although it only uses
+# select() and libslirp, which Winsock provides. Swap the two includes under _WIN32; nothing else in the file changes.
+case "$OS" in MINGW*|MSYS*)
+  sed -i -e 's|^#include <arpa/inet.h>.*$|#ifdef _WIN32\n#include <winsock2.h>\n#include <ws2tcpip.h>\n#else\n#include <arpa/inet.h>\n#endif|' \
+         -e 's|^#include <sys/select.h>$|#ifndef _WIN32\n#include <sys/select.h>\n#endif|' src/virtio-net-user-address-range.cpp
+  grep -q "winsock2.h" src/virtio-net-user-address-range.cpp || { echo "windows slirp patch did not apply"; exit 1; } ;;
+esac
 if [ "${FLASH_X:-no}" = yes ]; then
   sed -i.bak "/const pmem_flags flash_flags{/,/};/ s/\.X = false,/.X = true,/; /const pmas_flags flash_flags{/,/};/ s/\.X = false,/.X = true,/" src/machine-address-ranges.cpp
   grep -q "\.X = true" src/machine-address-ranges.cpp || { echo "flash patch did not apply"; exit 1; }
