@@ -2,8 +2,9 @@ name: Cartesi runner (Windows, macOS)
 
 # Builds local/cartesi/runner/run-cartesi-worker (UNATTESTED, DEV ONLY) on native runners: the emulator's own
 # Makefile builds libcartesi.a, then the C runner is linked against it. Runs on pushes to the unattested-local branch that touch the runner, and manually (workflow_dispatch).
-# The microarchitecture's pristine RAM and hash files need the riscv64 toolchain, so they are generated once
-# on Linux (docker image cartesi/machine-emulator:toolchain) and handed to the other jobs as an artifact.
+# The microarchitecture's pristine RAM and hash files need the riscv64 toolchain, and two generated headers need lua5.4,
+# so all four are generated once on Linux (docker image cartesi/machine-emulator:toolchain) and handed to the
+# other jobs as an artifact.
 #
 # UNTESTED: written without access to Windows or macOS machines; expect to iterate on the first runs.
 
@@ -34,10 +35,10 @@ jobs:
         run: |
           git clone -q --depth 1 --branch "${{ inputs.emulator_tag || 'v0.22.0' }}" https://github.com/cartesi/machine-emulator.git emu
           cd emu
-          git submodule update --init --depth 1 || true
+          sudo apt-get update -qq && sudo apt-get install -y -qq lua5.4
           make -C src cm-version.h interpret-jump-table.hpp
           make uarch-with-toolchain
-          mkdir -p ../uarch-out && cp uarch/uarch-pristine-ram.c uarch/uarch-pristine-hash.c ../uarch-out/
+          mkdir -p ../uarch-out && cp uarch/uarch-pristine-ram.c uarch/uarch-pristine-hash.c src/cm-version.h src/interpret-jump-table.hpp ../uarch-out/
           sha256sum ../uarch-out/*
       - uses: actions/upload-artifact@v4
         with: { name: uarch-pristine, path: uarch-out }
@@ -54,7 +55,7 @@ jobs:
           update: true
           install: >-
             git make mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf mingw-w64-x86_64-boost
-            mingw-w64-x86_64-libslirp mingw-w64-x86_64-glib2 mingw-w64-x86_64-lua
+            mingw-w64-x86_64-libslirp mingw-w64-x86_64-glib2
       - uses: actions/download-artifact@v4
         with: { name: uarch-pristine, path: uarch-in }
       - name: Build
@@ -76,7 +77,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      - run: brew install boost libslirp glib pkgconf lua@5.4
+      - run: brew install boost libslirp glib pkgconf
       - uses: actions/download-artifact@v4
         with: { name: uarch-pristine, path: uarch-in }
       - name: Build

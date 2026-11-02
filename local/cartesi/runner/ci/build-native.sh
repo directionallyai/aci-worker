@@ -4,8 +4,8 @@
 # Used by .github/workflows/cartesi-runner-native.yml. UNATTESTED, DEV ONLY (virtio-net via libslirp).
 #
 # usage: build-native.sh UARCH_DIR OUTDIR
-#   UARCH_DIR  holds uarch-pristine-ram.c and uarch-pristine-hash.c, generated once on Linux (they need the riscv64
-#              toolchain, which neither Windows nor macOS runners have; they are data, the same on every host)
+#   UARCH_DIR  holds uarch-pristine-ram.c, uarch-pristine-hash.c, cm-version.h and interpret-jump-table.hpp, generated
+#              once on Linux (they need the riscv64 toolchain and lua5.4, which the other runners do not have)
 #   OUTDIR     receives run-cartesi-worker[.exe] and a short report
 # env: EMULATOR_TAG (default v0.22.0), FLASH_X=yes to also make the flash drive executable (needed for a DAX root;
 #      see local/cartesi/README.md), THREADS (default yes on Windows, no on macOS: no libomp to bundle)
@@ -23,8 +23,8 @@ esac
 W="$(mktemp -d)"; cd "$W"
 git clone -q --depth 1 --branch "$TAG" https://github.com/cartesi/machine-emulator.git emu
 cd emu
-git submodule update --init --depth 1 third-party/llvm-flang-uint128 third-party/nlohmann-json third-party/ankerl 2>/dev/null || true
 cp "$UARCH_DIR"/uarch-pristine-ram.c "$UARCH_DIR"/uarch-pristine-hash.c uarch/
+cp "$UARCH_DIR"/cm-version.h "$UARCH_DIR"/interpret-jump-table.hpp src/ # generated on Linux (they need lua5.4)
 if [ "${FLASH_X:-no}" = yes ]; then
   sed -i.bak "/const pmem_flags flash_flags{/,/};/ s/\.X = false,/.X = true,/; /const pmas_flags flash_flags{/,/};/ s/\.X = false,/.X = true,/" src/machine-address-ranges.cpp
   grep -q "\.X = true" src/machine-address-ranges.cpp || { echo "flash patch did not apply"; exit 1; }
