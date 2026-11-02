@@ -76,10 +76,16 @@ every TLS handshake with "certificate is not yet valid"). Guest console goes to 
 it between slices of 2^27 cycles (exit 130); a halt exits with the guest's own code.
 
 Built against the dynamic library it boots the worker and serves real world requests. A fully static
-executable (`STATIC=1 runner/build-runner.sh`) currently fails to link on exactly three libraries,
-`libslirp`, `glib-2.0` and `pcre2-8`: Debian's `-dev` packages ship no static archives for them. Everything
-else (libcartesi.a, libstdc++, libgomp, libatomic, glibc) resolves statically. The next step is building
-those three statically from source (libslirp needs glib, glib needs pcre2, libffi and zlib), or a musl build.
+executable (`STATIC=1 runner/build-runner.sh`) does not link yet because Debian's `-dev` packages ship no
+static `libslirp` or `glib-2.0`; the emulator's own archive, libstdc++, libgomp, libatomic and glibc all
+resolve statically. The emulator uses neither library directly: it calls libslirp from one file
+(`src/virtio-net-user-address-range.cpp`, the user-mode network behind `-n`/`-p`), libslirp imports 28 glib
+functions (memory, strings, random numbers, logging, and process spawning for a guest-forward-to-command
+feature we do not use), and glib's only user of pcre2 is its regular-expression support, which libslirp does
+not use. So a static build should need `libslirp.a` and `libglib-2.0.a` but, untested, not pcre2 (a static
+link only pulls in the parts of `libglib.a` that are referenced). Alpine ships a static glib; libslirp would
+be built from source (meson, static, it needs only glib). TAP networking (`--virtio-net=<iface>`) needs
+neither, but needs root and a bridge on the host.
 
 ## The world-code cache
 

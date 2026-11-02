@@ -12,7 +12,7 @@ set -eu
 S=/usr/src/emulator/src
 if [ "$STATIC" = 1 ]; then
   g++ -O2 -Wall -Wextra -x c -I$S /runner/run-cartesi-worker.c -x none -o /out/run-cartesi-worker-static \
-      $S/libcartesi.a -static -fopenmp -lslirp -lglib-2.0 -lpcre2-8 -latomic
+      $S/libcartesi.a -static -fopenmp -lslirp -lglib-2.0 -latomic
   echo built /out/run-cartesi-worker-static
 else
   gcc -O2 -Wall -Wextra -I$S /runner/run-cartesi-worker.c -L$S -lcartesi -Wl,-rpath,/usr/lib -o /out/run-cartesi-worker
