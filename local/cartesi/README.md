@@ -43,26 +43,53 @@ The scripts take their mounts as documented in each header; paths default to
    against the release `SHA256SUMS`, unpacked to `pbs/`), then `assemble-uv-runtime.sh`.
 3. Build the image: `make-rootfs-uv.sh` (writes `rootfs-worker-uv.erofs`; `FORMAT=ext2` for ext2). Two builds
    from the same inputs give the same sha256.
-4. Boot with the command line (root mapped read-only, RAM tmpfs for `/tmp` and `/run`):
+4. Boot with the command line (root mapped read-only; init already mounts RAM tmpfs on `/tmp`, `/run` and `/dev/shm`):
 
    ```
    cartesi-machine --ram-image=linux-6.18.56-ctsi-1.bin \
      --flash-drive=label:root,data_filename:rootfs-worker-uv.erofs,read_only --append-bootargs=ro \
      --append-init='mount -t tmpfs -o size=16m tmpfs /run; touch /run/resolv.conf; mount -o bind /run/resolv.conf /etc/resolv.conf' \
      -n -p 0.0.0.0:8700:8700 -- \
-     'mount -t tmpfs -o size=64m,mode=1777 tmpfs /tmp; WARM_CACHE_SCOPE=global WARM_LIB=/opt/worker-runtime/lib/python3.12/site-packages WARM_SOCKET=/tmp/w.sock \
+     'WARM_CACHE_SCOPE=global WARM_LIB=/opt/worker-runtime/lib/python3.12/site-packages WARM_SOCKET=/tmp/w.sock \
       /opt/worker-runtime/bin/python3.12 /opt/worker-runtime/warm_server.py & \
       LOCAL_WARM_SOCKET=/tmp/w.sock LOCAL_LISTEN=0.0.0.0:8700 LOCAL_RUNTIME_DIR=/opt/worker-runtime LOCAL_SANDBOX=none /opt/bin/session_master_local'
    ```
 
    (`data_filename:`, not `filename:`. `-p` needs `-n`. The guest must listen on `0.0.0.0` because slirp
    forwards to 10.0.2.15. The `--append-init` goes before `-n`: on a read-only root `-n` would fail to write
-   `/etc/resolv.conf`, so a RAM file is bind-mounted over it first.)
+   `/etc/resolv.conf`, so a RAM file is bind-mounted over it first. The entrypoint runs as the unprivileged
+   user `dapp`, so it cannot mount anything; mounts belong in `--append-init`, which runs as root.)
 
 5. Or boot it with the C runner, no Lua: write the machine's configuration once with the command line
    (`... --max-mcycle=0 --store-config=worker.json`), replace the `date -s @<epoch>` boot command with
    `date -s @{{NOW}}` (see `runner/worker.config.example.json`), then
    `runner/build-runner.sh && run-cartesi-worker worker.json`.
+
+## What boots
+
+Read from a running machine (emulator v0.22.0, static runner):
+
+- **Kernel:** Linux 6.18.56-ctsi-1 for RISC-V (rv64imafdc plus the Zicntr/Zicsr/Zifencei/Zihpm/Zaamo/Zalrsc/Zca/Zcd
+  extensions, Sv39 paging), one hart. Command line: `quiet earlycon=sbi console=hvc0 root=/dev/pmem0 ro
+  init=/usr/sbin/cartesi-init`. Built in: erofs, ext2/3/4, squashfs, fuseblk. The virtio drivers present are net,
+  console, blk, rng, balloon, 9p and vsock; the machine has one virtio device (the network).
+- **Init:** PID 1 is `cartesi-init`, a 2.7 KB busybox shell script, not a service manager. It mounts `/proc`,
+  `/dev/pts`, `/dev/shm`, `/sys`, `/tmp` and `/run` (tmpfs, `/tmp` about half of RAM), sets the hostname, runs
+  the configuration's `init` commands **as root** (here: a RAM tmpfs on `/run`, the `eth0` address
+  10.0.2.15/24, route via 10.0.2.2, DNS 10.0.2.3, the clock), then runs the configuration's `entrypoint` **as
+  the unprivileged user `dapp`** (uid 1001, via `busybox su -p`, working directory `/home/dapp`). When the
+  entrypoint ends it remounts `/` read-only, unmounts everything and powers off, with the exit code passed to
+  the host if it is not zero.
+- **Processes:** five user processes and 23 kernel threads, nothing else (no sshd, cron or udev): `cartesi-init`
+  (1.2 MB), the entrypoint shell, the warm worker (27 MB), `session_master_local` (2.4 MB, the only listening
+  socket, TCP 8700) and, while a request runs, its forked child (about 21 MB).
+- **Memory:** 109 MB of RAM (the default 128 MiB less the kernel), about 50 MB free and 77 MB available shortly
+  after boot, 29 MB cache.
+- **Filesystems:** `/` is the erofs image on `/dev/pmem0` (186 MB, read-only); tmpfs on `/dev`, `/dev/shm`, `/tmp`
+  and `/run`; the bind-mounted `/etc/resolv.conf`. Writable space is RAM only.
+- **Network:** `eth0` (virtio-net, host user-mode network via libslirp), `lo`. The only way in is the host
+  port forward to 8700.
+- **Console:** `hvc0` (virtio console), going to the host's stdout.
 
 ## The C runner
 
@@ -167,8 +194,10 @@ itself is plain data in the machine configuration.
 
 ## Known gaps
 
-- **No sandbox**: `LOCAL_SANDBOX=none` (the Cartesi kernel's support for the user namespaces bubblewrap
-  needs was not checked); warm mode requires it.
+- **No sandbox inside the guest**: `LOCAL_SANDBOX=none` (the Cartesi kernel's support for the user namespaces
+  bubblewrap needs was not checked); warm mode requires it. The boundary is the virtual machine itself: the
+  worker and any submitted code run as the unprivileged user `dapp` on a read-only root, and the boot commands
+  run as root before that.
 - **No `queue_eval` / `local` channel**, so the scheduled reviewer cannot launch from this worker.
 - **The reviewer bundle is x86_64 only.** `_run_reviewer_agent` fetches one bundle by pointer (account
   `reviewer_bundle`, falling back to the shared one) with no architecture in the key; it is the x86_64

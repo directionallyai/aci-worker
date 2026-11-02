@@ -25,8 +25,7 @@ args = ap.parse_args()
 
 NAME = f"cm-bench-{args.label}"[:60]
 INIT = "mount -t tmpfs -o size=16m tmpfs /run; touch /run/resolv.conf; mount -o bind /run/resolv.conf /etc/resolv.conf"
-CMD = ("mount -t tmpfs -o size=64m,mode=1777 tmpfs /tmp; "
-       "WARM_CACHE_SCOPE=global WARM_LIB=/opt/worker-runtime/lib/python3.12/site-packages WARM_SOCKET=/tmp/w.sock "
+CMD = ("WARM_CACHE_SCOPE=global WARM_LIB=/opt/worker-runtime/lib/python3.12/site-packages WARM_SOCKET=/tmp/w.sock "
        "/opt/worker-runtime/bin/python3.12 /opt/worker-runtime/warm_server.py & "
        "LOCAL_WARM_SOCKET=/tmp/w.sock LOCAL_LISTEN=0.0.0.0:8700 LOCAL_RUNTIME_DIR=/opt/worker-runtime LOCAL_SANDBOX=none /opt/bin/session_master_local")
 sh = lambda *a: subprocess.run(a, capture_output=True, text=True)
