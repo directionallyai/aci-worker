@@ -44,6 +44,8 @@ jobs:
         run: sh local/cartesi/runner/ci/build-native.sh out
       - uses: actions/upload-artifact@v4
         with: { name: run-cartesi-worker-windows-x86_64, path: out }
+      - name: Smoke test, boot a guest with the binary just built
+        run: sh local/cartesi/runner/ci/smoke.sh out/run-cartesi-worker.exe
 
   macos:
     strategy:
@@ -65,3 +67,5 @@ jobs:
         run: sh local/cartesi/runner/ci/build-native.sh out
       - uses: actions/upload-artifact@v4
         with: { name: 'run-cartesi-worker-macos-${{ matrix.arch }}', path: out }
+      - name: Smoke test, boot a guest with the binary just built
+        run: sh local/cartesi/runner/ci/smoke.sh out/run-cartesi-worker
