@@ -67,7 +67,7 @@ case "$OS" in
   *)
     OMP=""; [ "$THREADS" = yes ] && OMP="-fopenmp"
     g++ -O2 -x c -I"$S" "$HERE/run-cartesi-worker.c" -x none -o "$OUT/run-cartesi-worker.exe" \
-      "$S/libcartesi.a" $(pkg-config --static --libs slirp) -static $OMP -lws2_32 -liphlpapi ;;
+      "$S/libcartesi.a" $(pkg-config --static --libs slirp) -static $OMP -lws2_32 -liphlpapi -liconv ;;
 esac
 strip "$OUT/run-cartesi-worker$EXT" 2>/dev/null || true
 {
