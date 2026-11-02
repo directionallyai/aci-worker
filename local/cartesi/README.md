@@ -20,6 +20,7 @@ it the same request `agent.py` sends to the attested worker.
 | `local/trace_server.py` | Tracing launcher: per-request timings of the parent and the child, split into TCP, TLS, wait and CPU. |
 | `make-uv-runtime.sh`, `assemble-uv-runtime.sh` | Build a riscv64 worker runtime the way worker-python-runtime's Dockerfile does (python-build-standalone + the locked packages), cross-compiling `cffi` and `cryptography`. |
 | `make-rootfs-uv.sh` | Builds the root image: Cartesi's Ubuntu 24.04 rootfs plus the `uv` runtime, `session_master_local` and `warm_server.py`. Uncompressed EROFS by default (reproducible), `FORMAT=ext2` for the older image. `make-rootfs.sh` is the earlier variant with Ubuntu's own Python. |
+| `make-rootfs-uv.sh` also takes an optional `/reviewer` tree (the extracted reviewer bundle, put at `/opt/reviewer` with empty `home/` and `work/`), a `/smoke.sh`, and `NAME=` for the output name; see `directionallyai/reviewer-agent`, branch `riscv64-bundle`. |
 | `make-rootfs-compressed.sh` | Builds the same tree as squashfs (zstd, xz, lz4, uncompressed) and EROFS (lz4hc, uncompressed) for comparison. |
 | `analysis/bench_rootfs.py` | Boots one root image the same way every time and measures boot, warm-up and real world requests (your own grant and keys, built in memory). |
 | `analysis/analyze_warm.py` | Per-request timeline of the warm worker (parent prep, child phases, TCP/TLS/wait/CPU per HTTPS call). |
@@ -42,7 +43,8 @@ The scripts take their mounts as documented in each header; paths default to
    `cpython-3.12.16+20261026-riscv64-unknown-linux-gnu-install_only_stripped` tarball, checked
    against the release `SHA256SUMS`, unpacked to `pbs/`), then `assemble-uv-runtime.sh`.
 3. Build the image: `make-rootfs-uv.sh` (writes `rootfs-worker-uv.erofs`; `FORMAT=ext2` for ext2). Two builds
-   from the same inputs give the same sha256.
+   from the same staged tree give the same sha256; the tree's own bytecode is compiled serially with a fixed
+   hash seed (`compileall -j 0` made it differ between builds).
 4. Boot with the command line (root mapped read-only; init already mounts RAM tmpfs on `/tmp`, `/run` and `/dev/shm`):
 
    ```

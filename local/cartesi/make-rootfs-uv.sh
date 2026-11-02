@@ -11,11 +11,17 @@
 #   FORMAT=ext2             the older 512 MB (SIZE_MB) ext2 image, the only one the v0.21.0
 #                           kernel can mount besides squashfs.
 #
+# Optional extras: a mounted /reviewer (the extracted reviewer bundle tree, which must contain a top-level
+# `reviewer/` directory's contents, i.e. runtime/ tools/ init ...) is added at /opt/reviewer with empty home/
+# and work/ directories for tmpfs mounts, and a mounted /smoke.sh at /opt/reviewer-smoke.sh. NAME changes the
+# output file name (default rootfs-worker-uv).
+#
 # Mounts: /work (rw; rootfs-ubuntu/ in, image out), /artifacts (ro), /uvrt (ro;
 # uv-runtime/out/runtime), /local (ro; aci-worker/local).
 set -eu
 FORMAT="${FORMAT:-erofs}"
 SIZE_MB="${SIZE_MB:-512}"
+NAME="${NAME:-rootfs-worker-uv}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq >/dev/null && apt-get install -y -qq e2fsprogs erofs-utils >/dev/null
 rm -rf /work/stage-uv && cp -a /work/rootfs-ubuntu /work/stage-uv
@@ -26,16 +32,22 @@ chmod 0755 /work/stage-uv/opt/worker-runtime/warm_server.py
 [ -f /local/trace_server.py ] && cp /local/trace_server.py /work/stage-uv/opt/worker-runtime/trace_server.py
 cp /artifacts/session_master_local /work/stage-uv/opt/bin/session_master_local
 chmod 0755 /work/stage-uv/opt/bin/session_master_local
+if [ -d /reviewer ]; then
+  cp -a /reviewer /work/stage-uv/opt/reviewer
+  mkdir -p /work/stage-uv/opt/reviewer/home /work/stage-uv/opt/reviewer/work
+  chmod 1777 /work/stage-uv/opt/reviewer/home /work/stage-uv/opt/reviewer/work
+fi
+if [ -f /smoke.sh ]; then cp /smoke.sh /work/stage-uv/opt/reviewer-smoke.sh; chmod 0755 /work/stage-uv/opt/reviewer-smoke.sh; fi
 chown -R 0:0 /work/stage-uv
 case "$FORMAT" in
   erofs)
-    OUT=/work/rootfs-worker-uv.erofs
+    OUT="/work/$NAME.erofs"
     rm -f "$OUT"
     # -T 0 and -U fix the two things that would otherwise differ between builds.
     mkfs.erofs -T 0 -U 00000000-0000-0000-0000-000000000000 --all-root "$OUT" /work/stage-uv >/dev/null
     ;;
   ext2)
-    OUT=/work/rootfs-worker-uv.ext2
+    OUT="/work/$NAME.ext2"
     rm -f "$OUT"
     mke2fs -q -t ext2 -b 4096 -m 0 -L rootfs -d /work/stage-uv "$OUT" "${SIZE_MB}M"
     e2fsck -fn "$OUT" | tail -1

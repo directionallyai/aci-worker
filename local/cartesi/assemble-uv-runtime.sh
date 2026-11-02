@@ -35,6 +35,7 @@ printf '%s\n' '#!/bin/sh' 'set -e' 'here="$(cd "$(dirname "$0")" && pwd)"' \
   'exec "$here/bin/python3.12" -c "import worker; worker.main()"' > "$R/runtime"
 chmod 0755 "$R/runtime"
 
-python3.12 -m compileall -q -j 0 --invalidation-mode unchecked-hash "$R/lib/python3.12"
+# serial with a fixed hash seed: -j 0 makes the compiled bytes differ between builds
+PYTHONHASHSEED=0 python3.12 -m compileall -q -j 1 --invalidation-mode unchecked-hash "$R/lib/python3.12"
 echo "packages in site-packages:"; ls "$SP" | grep -v "__pycache__" | tr '\n' ' '; echo
 echo "pyc files: $(find "$R" -name '*.pyc' | wc -l); size: $(du -sm "$R" | cut -f1) MB"
