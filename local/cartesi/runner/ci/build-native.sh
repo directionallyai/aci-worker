@@ -40,6 +40,9 @@ if [ "${FLASH_X:-no}" = yes ]; then
   grep -q "\.X = true" src/machine-address-ranges.cpp || { echo "flash patch did not apply"; exit 1; }
 fi
 
+# Windows: libslirp.h marks its functions __declspec(dllimport) unless LIBSLIRP_STATIC is defined, which the pkg-config
+# file lists under Cflags.private (for static linking). Without it the link wants the DLL's __imp_ symbols.
+case "$OS" in MINGW*|MSYS*) export CXXFLAGS="${CXXFLAGS:-} $(pkg-config --static --cflags slirp | tr ' ' '\n' | grep '^-D' | tr '\n' ' ')" ;; esac
 make -C src -j"$JOBS" release=yes threads="$THREADS" libcartesi.a
 S="$PWD/src"
 ls -la "$S/libcartesi.a"
