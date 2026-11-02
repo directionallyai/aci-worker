@@ -2,16 +2,22 @@
 user's own grant/keys (built in memory, never printed), and analyses the TRACE lines."""
 import importlib.machinery, importlib.util, json, os, socket, statistics as st, struct, subprocess, sys, time
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 7
-IMG = os.environ.get("CARTESI_IMAGES", os.path.expanduser("~/workspace/cartesi-worker/v0.21.0/images"))
+IMG = os.environ.get("CARTESI_IMAGES", os.path.expanduser("~/workspace/cartesi-worker/v0.22.0/images"))
+EMU = os.environ.get("CARTESI_EMU", "cartesi-me:0.22-local")
+KERNEL = os.environ.get("CARTESI_KERNEL", "linux-6.18.56-ctsi-1.bin")
+ROOTFS = os.environ.get("CARTESI_ROOTFS", "rootfs-worker-uv.erofs")
 NAME = "cm-trace"
-CMD = ("WARM_CACHE_SCOPE=global WARM_LIB=/opt/worker-runtime/lib/python3.12/site-packages WARM_SOCKET=/tmp/w.sock "
+# Read-only root, tmpfs for /tmp and /run; the bind mount keeps -n's write of /etc/resolv.conf working.
+INIT = "mount -t tmpfs -o size=16m tmpfs /run; touch /run/resolv.conf; mount -o bind /run/resolv.conf /etc/resolv.conf"
+CMD = ("mount -t tmpfs -o size=64m,mode=1777 tmpfs /tmp; WARM_CACHE_SCOPE=global WARM_LIB=/opt/worker-runtime/lib/python3.12/site-packages WARM_SOCKET=/tmp/w.sock "
        "/opt/worker-runtime/bin/python3.12 /opt/worker-runtime/trace_server.py & "
        "LOCAL_WARM_SOCKET=/tmp/w.sock LOCAL_LISTEN=0.0.0.0:8700 LOCAL_RUNTIME_DIR=/opt/worker-runtime LOCAL_SANDBOX=none /opt/bin/session_master_local")
 sh = lambda *a, **k: subprocess.run(a, capture_output=True, text=True, **k)
 sh("docker", "rm", "-f", NAME)
-sh("docker", "run", "-d", "--name", NAME, "-p", "127.0.0.1:18702:8700", "-v", f"{IMG}:/images:ro", "cartesi-me:0.21-local",
-   "cartesi-machine", "--ram-image=/images/linux-6.5.13-ctsi-2-v0.21.0.bin",
-   "--flash-drive=label:root,data_filename:/images/rootfs-worker-uv.ext2", "-n", "-p", "0.0.0.0:8700:8700", "--", CMD)
+sh("docker", "run", "-d", "--name", NAME, "-p", "127.0.0.1:18702:8700", "-v", f"{IMG}:/images:ro", EMU,
+   "cartesi-machine", f"--ram-image=/images/{KERNEL}",
+   f"--flash-drive=label:root,data_filename:/images/{ROOTFS},read_only", "--append-bootargs=ro", f"--append-init={INIT}",
+   "-n", "-p", "0.0.0.0:8700:8700", "--", CMD)
 try:
     for _ in range(180):
         if "warm worker ready" in sh("docker", "logs", NAME).stdout + sh("docker", "logs", NAME).stderr: break

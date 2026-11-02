@@ -1,0 +1,292 @@
+{
+  "cmio": {
+    "rx_buffer": {
+      "backing_store": {
+        "create": false,
+        "data_filename": "",
+        "dht_filename": "",
+        "dpt_filename": "",
+        "mark_pages_dirty": false,
+        "shared": false,
+        "truncate": false
+      }
+    },
+    "tx_buffer": {
+      "backing_store": {
+        "create": false,
+        "data_filename": "",
+        "dht_filename": "",
+        "dpt_filename": "",
+        "mark_pages_dirty": false,
+        "shared": false,
+        "truncate": false
+      }
+    }
+  },
+  "dtb": {
+    "backing_store": {
+      "create": false,
+      "data_filename": "",
+      "dht_filename": "",
+      "dpt_filename": "",
+      "mark_pages_dirty": false,
+      "shared": false,
+      "truncate": false
+    },
+    "bootargs": "quiet earlycon=sbi console=hvc0 uio_pdrv_genirq.of_id=generic-uio root=/dev/pmem0 ro init=/usr/sbin/cartesi-init ro",
+    "entrypoint": "mount -t tmpfs -o size=64m,mode=1777 tmpfs /tmp; WARM_CACHE_SCOPE=global WARM_LIB=/opt/worker-runtime/lib/python3.12/site-packages WARM_SOCKET=/tmp/w.sock /opt/worker-runtime/bin/python3.12 /opt/worker-runtime/warm_server.py & LOCAL_WARM_SOCKET=/tmp/w.sock LOCAL_LISTEN=0.0.0.0:8700 LOCAL_RUNTIME_DIR=/opt/worker-runtime LOCAL_SANDBOX=none /opt/bin/session_master_local",
+    "init": "echo \"\n         .\n        / \\\\\n      /    \\\\\n\\\\---/---\\\\  /----\\\\\n \\\\       X       \\\\\n  \\\\----/  \\\\---/---\\\\\n       \\\\    / CARTESI\n        \\\\ /   MACHINE\n         '\n\"\nmount -t tmpfs -o size=16m tmpfs /run; touch /run/resolv.conf; mount -o bind /run/resolv.conf /etc/resolv.conf\nbusybox ip link set dev eth0 up\nbusybox ip addr add 10.0.2.15/24 dev eth0\nbusybox ip route add default via 10.0.2.2 dev eth0\n[ -w /etc ] && echo 'nameserver 10.0.2.3' > /etc/resolv.conf\nbusybox date -s @{{NOW}} >> /dev/null\n"
+  },
+  "flash_drive": [
+    {
+      "backing_store": {
+        "create": false,
+        "data_filename": "/images/rootfs-worker-uv.erofs",
+        "dht_filename": "",
+        "dpt_filename": "",
+        "mark_pages_dirty": false,
+        "shared": false,
+        "truncate": false
+      },
+      "label": "root",
+      "length": 195883008,
+      "read_only": true,
+      "start": 2415919104
+    }
+  ],
+  "hash_tree": {
+    "create": false,
+    "hash_function": "keccak256",
+    "phtc_filename": "",
+    "phtc_size": 4096,
+    "shared": false,
+    "sht_filename": ""
+  },
+  "nvram": [],
+  "pmas": {
+    "backing_store": {
+      "create": false,
+      "data_filename": "",
+      "dht_filename": "",
+      "dpt_filename": "",
+      "mark_pages_dirty": false,
+      "shared": false,
+      "truncate": false
+    }
+  },
+  "processor": {
+    "backing_store": {
+      "create": false,
+      "data_filename": "",
+      "dht_filename": "",
+      "dpt_filename": "",
+      "mark_pages_dirty": false,
+      "shared": false,
+      "truncate": false
+    },
+    "registers": {
+      "clint": {
+        "mtimecmp": 0
+      },
+      "f0": 0,
+      "f1": 0,
+      "f10": 0,
+      "f11": 0,
+      "f12": 0,
+      "f13": 0,
+      "f14": 0,
+      "f15": 0,
+      "f16": 0,
+      "f17": 0,
+      "f18": 0,
+      "f19": 0,
+      "f2": 0,
+      "f20": 0,
+      "f21": 0,
+      "f22": 0,
+      "f23": 0,
+      "f24": 0,
+      "f25": 0,
+      "f26": 0,
+      "f27": 0,
+      "f28": 0,
+      "f29": 0,
+      "f3": 0,
+      "f30": 0,
+      "f31": 0,
+      "f4": 0,
+      "f5": 0,
+      "f6": 0,
+      "f7": 0,
+      "f8": 0,
+      "f9": 0,
+      "fcsr": 0,
+      "htif": {
+        "fromhost": 0,
+        "iconsole": 2,
+        "ihalt": 1,
+        "iyield": 3,
+        "tohost": 0
+      },
+      "icycleinstret": 0,
+      "iflags": {
+        "H": 0,
+        "X": 0,
+        "Y": 0
+      },
+      "ilrsc": -1,
+      "imcyclemax": -1,
+      "iprv": 3,
+      "iunrep": 1,
+      "marchid": 22,
+      "mcause": 0,
+      "mcounteren": 0,
+      "mcycle": 0,
+      "medeleg": 0,
+      "menvcfg": 0,
+      "mepc": 0,
+      "mideleg": 0,
+      "mie": 0,
+      "mimpid": 22,
+      "mip": 0,
+      "misa": -9223372036853460691,
+      "mscratch": 0,
+      "mstatus": 42949672960,
+      "mtval": 0,
+      "mtvec": 0,
+      "mvendorid": 7161130726739634464,
+      "pc": 2147483648,
+      "plic": {
+        "girqpend": 0,
+        "girqsrvd": 0
+      },
+      "satp": 0,
+      "scause": 0,
+      "scounteren": 0,
+      "senvcfg": 0,
+      "sepc": 0,
+      "sscratch": 0,
+      "stval": 0,
+      "stvec": 0,
+      "x0": 0,
+      "x1": 0,
+      "x10": 0,
+      "x11": 2146435072,
+      "x12": 0,
+      "x13": 0,
+      "x14": 0,
+      "x15": 0,
+      "x16": 0,
+      "x17": 0,
+      "x18": 0,
+      "x19": 0,
+      "x2": 0,
+      "x20": 0,
+      "x21": 0,
+      "x22": 0,
+      "x23": 0,
+      "x24": 0,
+      "x25": 0,
+      "x26": 0,
+      "x27": 0,
+      "x28": 0,
+      "x29": 0,
+      "x3": 0,
+      "x30": 0,
+      "x31": 0,
+      "x4": 0,
+      "x5": 0,
+      "x6": 0,
+      "x7": 0,
+      "x8": 0,
+      "x9": 0
+    }
+  },
+  "ram": {
+    "backing_store": {
+      "create": false,
+      "data_filename": "/images/linux-6.18.56-ctsi-1.bin",
+      "dht_filename": "",
+      "dpt_filename": "",
+      "mark_pages_dirty": false,
+      "shared": false,
+      "truncate": false
+    },
+    "length": 134217728
+  },
+  "uarch": {
+    "processor": {
+      "backing_store": {
+        "create": false,
+        "data_filename": "",
+        "dht_filename": "",
+        "dpt_filename": "",
+        "mark_pages_dirty": false,
+        "shared": false,
+        "truncate": false
+      },
+      "registers": {
+        "cycle": 0,
+        "halt": 0,
+        "pc": 6291456,
+        "x0": 0,
+        "x1": 0,
+        "x10": 0,
+        "x11": 0,
+        "x12": 0,
+        "x13": 0,
+        "x14": 0,
+        "x15": 0,
+        "x16": 0,
+        "x17": 0,
+        "x18": 0,
+        "x19": 0,
+        "x2": 0,
+        "x20": 0,
+        "x21": 0,
+        "x22": 0,
+        "x23": 0,
+        "x24": 0,
+        "x25": 0,
+        "x26": 0,
+        "x27": 0,
+        "x28": 0,
+        "x29": 0,
+        "x3": 0,
+        "x30": 0,
+        "x31": 0,
+        "x4": 0,
+        "x5": 0,
+        "x6": 0,
+        "x7": 0,
+        "x8": 0,
+        "x9": 0
+      }
+    },
+    "ram": {
+      "backing_store": {
+        "create": false,
+        "data_filename": "",
+        "dht_filename": "",
+        "dpt_filename": "",
+        "mark_pages_dirty": false,
+        "shared": false,
+        "truncate": false
+      }
+    }
+  },
+  "virtio": [
+    {
+      "hostfwd": [
+        {
+          "guest_ip": 167772687,
+          "guest_port": 8700,
+          "host_ip": 0,
+          "host_port": 8700,
+          "is_udp": false
+        }
+      ],
+      "type": "net-user"
+    }
+  ]
+}
