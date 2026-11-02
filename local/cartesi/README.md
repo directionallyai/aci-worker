@@ -184,6 +184,28 @@ world requests `/tmp` held 0 MB (only the socket) and `/run` about 0 MB. The gue
 default; after the requests about 77 MB was still available (warm process 28 MB, 33 MB once the cache is
 filled; a child 20-23 MB, mostly shared via fork). Not measured: several children at once.
 
+### What a guest costs the host (emulator v0.22.0, static runner, `/proc/<pid>/status` of the emulator)
+
+Guest RAM that is never touched is not resident on the host, but everything the guest touches stays resident
+even after the guest frees it (the guest has a balloon driver; nothing here uses it). The host sees two kinds of
+memory: anonymous (the guest RAM it touched) and file-backed (the mapped root image, clean, shared and
+reclaimable by the host).
+
+| Guest | Host resident (RSS) | anonymous / file |
+|---|---|---|
+| 1.5 GiB, idle after boot | 129 MiB | 105 / 24 MiB |
+| 512 MiB, Hermes start-up check | 318 MiB | 243 / 74 MiB |
+| 1.5 GiB, Hermes start-up check | 335 MiB | 261 / 74 MiB |
+| 1.5 GiB, after reading ~470 MiB of files (`tar` of `/opt /usr /lib /bin /sbin /etc`) | **1,035 MiB** | 601 / 433 MiB |
+
+So tripling the guest's RAM costs nothing by itself (318 against 335 MiB), but file reads do: the guest keeps
+a copy of every file it reads in its own page cache (3.5 to 469 MiB here) while the host also holds the mapped
+image pages (433 MiB), so a read-heavy guest costs the host roughly twice the data it read. A long-lived guest
+can creep toward its full RAM size plus the mapped image; a guest sized to the real working set (256-512 MiB for
+the reviewer's start-up) caps that, and the machine boots in about 5 s, so one machine per task is cheap.
+Not tried: mounting the erofs root with DAX, which should let the guest read the pmem directly instead of
+copying into its page cache.
+
 ### Mapping and stored images
 
 The emulator maps both files with `mmap`, privately: the kernel image is a `rw-p` mapping at the start of
