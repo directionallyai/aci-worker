@@ -3,14 +3,12 @@
 # emulator's own sources: libcartesi.a with the emulator's Makefile, then the C runner linked against it.
 # Used by .github/workflows/cartesi-runner-native.yml. UNATTESTED, DEV ONLY (virtio-net via libslirp).
 #
-# usage: build-native.sh UARCH_DIR OUTDIR
-#   UARCH_DIR  holds uarch-pristine-ram.c, uarch-pristine-hash.c, cm-version.h and interpret-jump-table.hpp, generated
-#              once on Linux (they need the riscv64 toolchain and lua5.4, which the other runners do not have)
+# usage: build-native.sh OUTDIR
 #   OUTDIR     receives run-cartesi-worker[.exe] and a short report
 # env: EMULATOR_TAG (default v0.22.0), FLASH_X=yes to also make the flash drive executable (needed for a DAX root;
 #      see local/cartesi/README.md), THREADS (default yes on Windows, no on macOS: no libomp to bundle)
 set -eu
-UARCH_DIR="$(cd "$1" && pwd)"; OUT="$2"; mkdir -p "$OUT"; OUT="$(cd "$OUT" && pwd)"
+OUT="$1"; mkdir -p "$OUT"; OUT="$(cd "$OUT" && pwd)"
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 TAG="${EMULATOR_TAG:-v0.22.0}"
 OS="$(uname -s)"
@@ -23,8 +21,12 @@ esac
 W="$(mktemp -d)"; cd "$W"
 git clone -q --depth 1 --branch "$TAG" https://github.com/cartesi/machine-emulator.git emu
 cd emu
-cp "$UARCH_DIR"/uarch-pristine-ram.c "$UARCH_DIR"/uarch-pristine-hash.c uarch/
-cp "$UARCH_DIR"/cm-version.h "$UARCH_DIR"/interpret-jump-table.hpp src/ # generated on Linux (they need lua5.4)
+# The runner never steps the microarchitecture, so its pristine RAM image and hash are stand-ins instead of the real
+# generated files (which need the riscv64 toolchain). Checked on Linux: a runner built this way boots the guest.
+printf '#include <stddef.h>\nunsigned char uarch_pristine_ram[] = {0};\nunsigned int uarch_pristine_ram_len = 1;\n' > uarch/uarch-pristine-ram.c
+printf 'const unsigned char uarch_pristine_hash[32] = {0};\nconst unsigned int uarch_pristine_hash_len = 32;\n' > uarch/uarch-pristine-hash.c
+# The emulator generates interpret-jump-table.hpp with a script whose shebang is `lua5.4`.
+command -v lua5.4 >/dev/null 2>&1 || { l="$(command -v lua)"; mkdir -p "$W/bin"; ln -s "$l" "$W/bin/lua5.4"; export PATH="$W/bin:$PATH"; }
 if [ "${FLASH_X:-no}" = yes ]; then
   sed -i.bak "/const pmem_flags flash_flags{/,/};/ s/\.X = false,/.X = true,/; /const pmas_flags flash_flags{/,/};/ s/\.X = false,/.X = true,/" src/machine-address-ranges.cpp
   grep -q "\.X = true" src/machine-address-ranges.cpp || { echo "flash patch did not apply"; exit 1; }
