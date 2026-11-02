@@ -1,13 +1,18 @@
 name: Cartesi runner (Windows, macOS)
 
 # Builds local/cartesi/runner/run-cartesi-worker (UNATTESTED, DEV ONLY) on native runners: the emulator's own
-# Makefile builds libcartesi.a, then the C runner is linked against it. Manual only (workflow_dispatch).
+# Makefile builds libcartesi.a, then the C runner is linked against it. Runs on pushes to the unattested-local branch that touch the runner, and manually (workflow_dispatch).
 # The microarchitecture's pristine RAM and hash files need the riscv64 toolchain, so they are generated once
 # on Linux (docker image cartesi/machine-emulator:toolchain) and handed to the other jobs as an artifact.
 #
 # UNTESTED: written without access to Windows or macOS machines; expect to iterate on the first runs.
 
 on:
+  push:
+    branches: [ unattested-local ]
+    paths:
+      - 'local/cartesi/runner/**'
+      - '.github/workflows/cartesi-runner-native.yml'
   workflow_dispatch:
     inputs:
       emulator_tag:
@@ -27,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Generate the pristine uarch files
         run: |
-          git clone -q --depth 1 --branch "${{ inputs.emulator_tag }}" https://github.com/cartesi/machine-emulator.git emu
+          git clone -q --depth 1 --branch "${{ inputs.emulator_tag || 'v0.22.0' }}" https://github.com/cartesi/machine-emulator.git emu
           cd emu
           git submodule update --init --depth 1 || true
           make -C src cm-version.h interpret-jump-table.hpp
@@ -53,7 +58,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: uarch-pristine, path: uarch-in }
       - name: Build
-        env: { FLASH_X: '${{ inputs.flash_x }}', EMULATOR_TAG: '${{ inputs.emulator_tag }}' }
+        env: { FLASH_X: '${{ inputs.flash_x || 'no' }}', EMULATOR_TAG: '${{ inputs.emulator_tag || 'v0.22.0' }}' }
         run: sh local/cartesi/runner/ci/build-native.sh uarch-in out
       - uses: actions/upload-artifact@v4
         with: { name: run-cartesi-worker-windows-x86_64, path: out }
@@ -73,7 +78,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: uarch-pristine, path: uarch-in }
       - name: Build
-        env: { FLASH_X: '${{ inputs.flash_x }}', EMULATOR_TAG: '${{ inputs.emulator_tag }}' }
+        env: { FLASH_X: '${{ inputs.flash_x || 'no' }}', EMULATOR_TAG: '${{ inputs.emulator_tag || 'v0.22.0' }}' }
         run: sh local/cartesi/runner/ci/build-native.sh uarch-in out
       - uses: actions/upload-artifact@v4
         with: { name: 'run-cartesi-worker-macos-${{ matrix.arch }}', path: out }
