@@ -28,6 +28,19 @@ aci-attestation = ["dep:sev"]
 # that feature's own ACI handler.
 mock-attestation = ["aci-attestation"]
 
+# DEV ONLY, NOT ATTESTED: builds src/bin/session_master_local.rs, a plain
+# TCP listener that runs the worker with no SEV-SNP/MAA handshake and no
+# encryption, for running the worker inside an emulator (e.g. a Cartesi
+# machine) or on a laptop. Never enable together with `aci-attestation`
+# (that file refuses to compile if both are on) and never in
+# aci/Dockerfile's production build.
+unattested-local = []
+
+[[bin]]
+name = "session_master_local"
+path = "src/bin/session_master_local.rs"
+required-features = ["unattested-local"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
